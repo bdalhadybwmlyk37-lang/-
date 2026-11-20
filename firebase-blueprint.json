@@ -1,0 +1,259 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private user preferences for Fahem Blan voice and app settings.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "voiceEnabled": {
+          "type": "boolean",
+          "description": "Whether Darija text-to-speech is enabled."
+        },
+        "voiceGender": {
+          "type": "string",
+          "enum": ["male", "female"],
+          "description": "Preferred Darija TTS voice persona."
+        },
+        "speechRate": {
+          "type": "number",
+          "description": "Speech playback rate between 0.7 and 1.4."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "voiceEnabled", "voiceGender", "speechRate", "createdAt", "updatedAt"]
+    },
+    "FloorPlan": {
+      "title": "FloorPlan",
+      "description": "Analyzed architectural floorplan with Moroccan Darija explanation, materials, and work phases.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "buildingType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "totalAreaSqm": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "roomsCount": {
+          "type": "integer"
+        },
+        "darijaSummary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "audioScript": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "rooms": {
+          "type": "array"
+        },
+        "materials": {
+          "type": "array"
+        },
+        "workPhases": {
+          "type": "array"
+        },
+        "warningsDarija": {
+          "type": "array"
+        },
+        "thumbnailDataUrl": {
+          "type": "string",
+          "maxLength": 250000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "title",
+        "buildingType",
+        "totalAreaSqm",
+        "roomsCount",
+        "darijaSummary",
+        "audioScript",
+        "rooms",
+        "materials",
+        "workPhases",
+        "warningsDarija",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "VoiceNote": {
+      "title": "VoiceNote",
+      "description": "Construction site voice idea captured and organized in Moroccan Darija.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "rawTranscript": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3000
+        },
+        "structuredDarija": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "title", "rawTranscript", "structuredDarija", "createdAt"]
+    },
+    "AccessCode": {
+      "title": "AccessCode",
+      "description": "Admin-managed activation codes with per-code trial counter and active toggle.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "code": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "trials": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "name", "code", "isActive", "trials", "createdAt"]
+    },
+    "TtsApiKey": {
+      "title": "TtsApiKey",
+      "description": "Backend-encrypted Gemini TTS API keys (AQ. / AIza) with rotation order and 24h quota status.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "key": {
+          "type": "string",
+          "description": "AES-256-GCM encrypted key ciphertext generated strictly on backend.",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "order": {
+          "type": "integer",
+          "description": "Rotation slot index from 1 to 20."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "exhausted"]
+        },
+        "lastUsed": {
+          "type": "integer",
+          "description": "Unix epoch ms when this key was last used or marked exhausted."
+        },
+        "failCount": {
+          "type": "integer",
+          "description": "Consecutive failure count for rotation diagnostics."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "key", "order", "status", "lastUsed", "failCount", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user settings and voice preferences keyed by auth UID."
+    },
+    "/plans/{planId}": {
+      "schema": { "$ref": "#/entities/FloorPlan" },
+      "description": "Analyzed architectural floorplans owned by a user."
+    },
+    "/voiceNotes/{noteId}": {
+      "schema": { "$ref": "#/entities/VoiceNote" },
+      "description": "Site voice notes and Darija task breakdowns owned by a user."
+    },
+    "/accessCodes/{codeId}": {
+      "schema": { "$ref": "#/entities/AccessCode" },
+      "description": "Activation codes managed in /admin (name + code)."
+    },
+    "/tts_api_keys/{keyId}": {
+      "schema": { "$ref": "#/entities/TtsApiKey" },
+      "description": "Encrypted TTS API keys managed exclusively by admin in /admin."
+    }
+  }
+}

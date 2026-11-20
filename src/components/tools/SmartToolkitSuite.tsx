@@ -862,8 +862,14 @@ export const SmartToolkitSuite: React.FC<SmartToolkitProps> = ({toolId}) => {
             mimeType: prepared.mimeType,
           }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'تعذر فحص الصورة');
+        const rawText = await res.text();
+        let data: CrackDiagnosis & {error?: string; success?: boolean};
+        try {
+          data = JSON.parse(rawText) as CrackDiagnosis & {error?: string; success?: boolean};
+        } catch {
+          throw new Error('تعذر تحليل الصورة، عاود حاول');
+        }
+        if (!res.ok || data.success === false) throw new Error(data.error || 'تعذر فحص الصورة');
         await consumeTrial();
         setCrackResult(data as CrackDiagnosis);
         setCrackLoading(false);

@@ -41,8 +41,23 @@ const serverAccessCodes: ServerAccessCode[] = [
   },
 ];
 
+function resolveServerAiApiKey(): string | null {
+  const candidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+    process.env.AI_API_KEY,
+  ];
+  for (const val of candidates) {
+    const trimmed = typeof val === 'string' ? val.trim() : '';
+    if (trimmed && trimmed !== 'MY_GEMINI_API_KEY') {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
 function getAiClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = resolveServerAiApiKey();
   if (!apiKey) {
     return null;
   }
@@ -96,7 +111,7 @@ async function generateJsonWithRetry(
     responseSchema: Record<string, unknown>;
   }
 ): Promise<unknown> {
-  const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+  const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
   let lastErr: unknown = null;
 
   for (const model of modelsToTry) {
@@ -265,11 +280,27 @@ const CRACK_RESPONSE_SCHEMA = {
 async function startServer() {
   const app = express();
   app.use(express.json({limit: '15mb'}));
+  app.use(
+    (
+      err: unknown,
+      req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (req.path.startsWith('/api/')) {
+        const msg =
+          err instanceof Error ? err.message : 'تعذر قراءة بيانات الطلب المرسل إلى الخادم';
+        res.status(400).json({success: false, error: msg});
+        return;
+      }
+      next(err);
+    }
+  );
 
   app.get('/api/health', (_req, res) => {
     res.json({
       ok: true,
-      aiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      aiConfigured: Boolean(resolveServerAiApiKey()),
     });
   });
 
@@ -481,40 +512,53 @@ async function startServer() {
   });
 
   app.post('/api/analyze-plan', async (req, res) => {
-    const ai = getAiClient();
-    if (!ai) {
-      res.status(503).json({
-        error: 'خدمة تحليل الصور غير مفعلة حالياً على الخادم.',
-      });
-      return;
-    }
-
-    const {imageBase64, mimeType, notes} = req.body as {
-      imageBase64?: string;
-      mimeType?: string;
-      notes?: string;
-    };
-
-    if (!imageBase64 || typeof imageBase64 !== 'string') {
-      res.status(400).json({error: 'خاصك تصور ولا ترفع صورة ديال البلان أولا.'});
-      return;
-    }
-
-    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
-    const safeMime = mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg';
-    const trimmedNotes = (notes || '').trim();
-    const analysisCacheKey = crypto
-      .createHash('sha256')
-      .update(`${cleanBase64}::${trimmedNotes}`)
-      .digest('hex');
-
-    const cachedPlan = planAnalysisCache.get(analysisCacheKey);
-    if (cachedPlan) {
-      res.json(cachedPlan);
-      return;
-    }
-
     try {
+      const ai = getAiClient();
+      if (!ai) {
+        res.status(503).json({
+          success: false,
+          error: 'مفتاح الذكاء الاصطناعي غير مضبوط على الخادم (GEMINI_API_KEY).',
+        });
+        return;
+      }
+
+      const body = (req.body && typeof req.body === 'object' ? req.body : {}) as {
+        imageBase64?: string;
+        mimeType?: string;
+        notes?: string;
+      };
+      const {imageBase64, mimeType, notes} = body;
+
+      if (!imageBase64 || typeof imageBase64 !== 'string') {
+        res.status(400).json({
+          success: false,
+          error: 'خاصك تصور ولا ترفع صورة ديال البلان أولا.',
+        });
+        return;
+      }
+
+      const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
+      if (!cleanBase64) {
+        res.status(400).json({
+          success: false,
+          error: 'صورة البلان غير صالحة، عاود رفع الصورة.',
+        });
+        return;
+      }
+
+      const safeMime = mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg';
+      const trimmedNotes = (notes || '').trim();
+      const analysisCacheKey = crypto
+        .createHash('sha256')
+        .update(`${cleanBase64}::${trimmedNotes}`)
+        .digest('hex');
+
+      const cachedPlan = planAnalysisCache.get(analysisCacheKey);
+      if (cachedPlan) {
+        res.status(200).json({success: true, ...cachedPlan});
+        return;
+      }
+
       const promptText = [
         'حلل هاد الصورة مزيان: أول حاجة تأكد واش هادي صورة ديال بلان بناء أو بلان ديال الحديد (مخطط هندسي، رسومات معمارية، أو تسليح).',
         'إلى ما كانتش صورة بلان ديال البناء ولا الحديد، رجع isBlueprint: false وحط بالضبط فـ darijaSummary وفـ audioScript: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".',
@@ -554,11 +598,14 @@ async function startServer() {
       }
       planAnalysisCache.set(analysisCacheKey, parsed);
 
-      res.json(parsed);
+      res.status(200).json({success: true, ...parsed});
     } catch (err) {
       console.error('Gemini analyze-plan error:', err);
-      const message = err instanceof Error ? err.message : 'وقع مشكل أثناء تحليل البلان';
-      res.status(500).json({error: `وقع خطأ تقني فالتحليل: ${message}`});
+      const message = err instanceof Error ? err.message : 'تعذر تحليل البلان، عاود حاول';
+      res.status(500).json({
+        success: false,
+        error: `تعذر تحليل البلان، عاود حاول (${message})`,
+      });
     }
   });
 
@@ -1456,6 +1503,26 @@ async function startServer() {
       results,
     });
   });
+
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({success: false, error: 'نقطة الاتصال غير موجودة'});
+  });
+
+  app.use(
+    (
+      err: unknown,
+      req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (req.path.startsWith('/api/')) {
+        const msg = err instanceof Error ? err.message : 'تعذر تحليل البلان، عاود حاول';
+        res.status(500).json({success: false, error: msg});
+        return;
+      }
+      next(err);
+    }
+  );
 
   const httpServer = http.createServer(app);
 

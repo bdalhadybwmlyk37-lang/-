@@ -57,6 +57,18 @@ function readPlanAnalysisCache(key: string): FloorPlanAnalysis | null {
   return null;
 }
 
+function parseApiJsonSafe<T>(rawText: string, fallbackError = 'تعذر تحليل البلان، عاود حاول'): T {
+  try {
+    const parsed = JSON.parse(rawText) as T;
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error(fallbackError);
+    }
+    return parsed;
+  } catch {
+    throw new Error(fallbackError);
+  }
+}
+
 function writePlanAnalysisCache(key: string, value: FloorPlanAnalysis): void {
   planMemoryCache.set(key, value);
   try {
@@ -135,7 +147,11 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     chatEndRef.current?.scrollIntoView({behavior: 'smooth'});
   }, [chatMessages, isAnalyzing, isChatSending]);
 
-  const runAnalysis = async (srcToAnalyze: string, extraNotes?: string) => {
+  const runAnalysis = async (
+    srcToAnalyze: string,
+    extraNotes?: string,
+    bypassCache = false
+  ) => {
     const allowance = await checkAllowanceBeforeAnalysis();
     if (!allowance.allowed) {
       setErrorMsg(
@@ -164,15 +180,29 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     ]);
 
     try {
-      // 1) Downscale & compress image to 1024px JPEG before Gemini Vision
-      const prepared = await prepareImageFromSrc(srcToAnalyze);
-      setThumbnailUrl(prepared.thumbnailDataUrl);
-      setPreparedDataUrl(prepared.analysisDataUrl);
-      setPreparedMime(prepared.mimeType);
+      // 1) Downscale & compress image to 1024px JPEG before Gemini Vision (with fallback if blob URL was revoked)
+      let analysisDataUrl = preparedDataUrl;
+      let mimeType = preparedMime;
+      try {
+        const prepared = await prepareImageFromSrc(srcToAnalyze);
+        setThumbnailUrl(prepared.thumbnailDataUrl);
+        setPreparedDataUrl(prepared.analysisDataUrl);
+        setPreparedMime(prepared.mimeType);
+        analysisDataUrl = prepared.analysisDataUrl;
+        mimeType = prepared.mimeType;
+      } catch (imgErr) {
+        if (!analysisDataUrl) {
+          throw imgErr;
+        }
+      }
+
+      if (!analysisDataUrl) {
+        throw new Error('تعذر تحليل البلان، عاود حاول');
+      }
 
       const cleanNotes = (extraNotes ?? notes).trim();
-      const cacheKey = hashStringKey(`${prepared.analysisDataUrl}::${cleanNotes}`);
-      let data = readPlanAnalysisCache(cacheKey);
+      const cacheKey = hashStringKey(`${analysisDataUrl}::${cleanNotes}`);
+      let data = bypassCache ? null : readPlanAnalysisCache(cacheKey);
       const fromCache = Boolean(data);
 
       // 2) Call Gemini Vision directly only if not already cached
@@ -181,15 +211,19 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            imageBase64: prepared.analysisDataUrl,
-            mimeType: prepared.mimeType,
+            imageBase64: analysisDataUrl,
+            mimeType,
             notes: cleanNotes,
           }),
         });
 
-        const rawJson = (await res.json()) as FloorPlanAnalysis & {error?: string};
-        if (!res.ok) {
-          throw new Error(rawJson.error || 'وقع مشكل أثناء تحليل البلان');
+        const rawText = await res.text();
+        const rawJson = parseApiJsonSafe<
+          FloorPlanAnalysis & {success?: boolean; error?: string}
+        >(rawText, 'تعذر تحليل البلان، عاود حاول');
+
+        if (!res.ok || rawJson.success === false) {
+          throw new Error(rawJson.error || 'تعذر تحليل البلان، عاود حاول');
         }
         data = rawJson;
         writePlanAnalysisCache(cacheKey, data);
@@ -227,9 +261,9 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
       }
     } catch (err) {
       setErrorMsg(
-        err instanceof Error
+        err instanceof Error && err.message
           ? err.message
-          : 'ما قدرناش نحللو البلان دابا، تأكد من الاتصال وجرب مرة أخرى.'
+          : 'تعذر تحليل البلان، عاود حاول'
       );
       setIsAnalyzing(false);
     }
@@ -284,8 +318,12 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
           message: textToSend,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
+      const rawText = await res.text();
+      const data = parseApiJsonSafe<{reply?: string; error?: string; success?: boolean}>(
+        rawText,
+        'تعذر الرد دابا، عاود حاول'
+      );
+      if (!res.ok || data.success === false) {
         throw new Error(data.error || 'تعذر الرد دابا');
       }
 
@@ -587,7 +625,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
             <button
               type="button"
               disabled={isAnalyzing}
-              onClick={() => runAnalysis(previewSrc, notes)}
+              onClick={() => runAnalysis(previewSrc, notes, true)}
               className="min-h-[44px] rounded-xl border border-[#ff7a1a]/40 bg-[#ff7a1a]/15 hover:bg-[#ff7a1a] hover:text-[#0a0f1e] text-[#ff7a1a] px-5 py-2 text-sm font-bold whitespace-nowrap transition-colors disabled:opacity-50"
             >
               {isAnalyzing ? 'جاري التحليل...' : 'عاود قرا وحلل البلان'}

@@ -628,8 +628,19 @@ export const FieldToolsSuite: React.FC<FieldToolsProps> = ({
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({rawIdea}),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'تعذر تنظيم الفكرة');
+        const rawText = await res.text();
+        let data: {title?: string; structuredDarija?: string; error?: string; success?: boolean};
+        try {
+          data = JSON.parse(rawText) as {
+            title?: string;
+            structuredDarija?: string;
+            error?: string;
+            success?: boolean;
+          };
+        } catch {
+          throw new Error('تعذر تنظيم الفكرة، عاود حاول');
+        }
+        if (!res.ok || data.success === false) throw new Error(data.error || 'تعذر تنظيم الفكرة');
         const title = data.title || 'ملاحظة من الشانطي';
         const structured = data.structuredDarija || rawIdea;
         await onSaveVoiceNote(title, rawIdea, structured);

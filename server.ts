@@ -136,12 +136,16 @@ async function generateJsonWithRetry(
       } catch (err) {
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
+        const lower = msg.toLowerCase();
         const isTransient =
-          msg.includes('503') ||
-          msg.includes('UNAVAILABLE') ||
-          msg.includes('429') ||
-          msg.includes('RESOURCE_EXHAUSTED');
+          lower.includes('503') ||
+          lower.includes('unavailable') ||
+          lower.includes('overloaded') ||
+          lower.includes('high demand') ||
+          lower.includes('429') ||
+          lower.includes('resource_exhausted');
         if (isTransient && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 650));
           continue;
         }
         break;
@@ -792,8 +796,9 @@ async function startServer() {
 
   const ttsCache = new Map<string, {audioBase64: string; mimeType: string; provider: string}>();
 
-  // --- Encrypted TTS API Key Pool & Round-Robin Rotation Vault ---
+  // --- Encrypted TTS API Key Pool & Auto-Rotation Vault (Up to 20 Keys) ---
   type TtsKeyStatus = 'active' | 'exhausted';
+  type TtsFailureReason = 'no_keys' | 'invalid_key' | 'quota_exhausted' | 'unavailable';
   interface StoredTtsApiKey {
     key: string; // AES-256-GCM encrypted ciphertext ONLY (never plaintext)
     order: number; // 1..20
@@ -809,16 +814,20 @@ async function startServer() {
     status: TtsKeyStatus;
     lastUsed: number;
     failCount: number;
+    source?: 'vault' | 'env';
   }
 
   const MAX_TTS_KEY_SLOTS = 20;
   const TTS_KEY_RESET_MS = 24 * 60 * 60 * 1000;
   const TTS_MAX_SERVER_CACHE = 250;
-  const TTS_MAX_SILENT_RETRIES = MAX_TTS_KEY_SLOTS;
-  const TTS_ALL_EXHAUSTED_COOLDOWN_MS = 60_000;
+  const TTS_ALL_EXHAUSTED_COOLDOWN_MS = 45_000;
+  const TTS_MODELS_TO_TRY = [
+    'gemini-3.8-flash-lite-tts',
+    'gemini-3.8-flash-tts',
+    'gemini-2.5-flash-preview-tts',
+  ];
   const TTS_VAULT_FILE = path.resolve(__dirname, '.tts_api_keys.enc.json');
   let ttsRoundRobinCursor = 0;
-  let lastUsedKeyOrder: number | null = null;
   let ttsAllExhaustedUntilMs = 0;
 
   function getTtsVaultCipherKey(): Buffer {
@@ -888,6 +897,28 @@ async function startServer() {
     }
   }
 
+  function resolveEnvTtsSlotKeys(): Map<number, string> {
+    const map = new Map<number, string>();
+    const listRaw = process.env.GEMINI_TTS_KEYS || '';
+    if (listRaw.trim()) {
+      const splitList = listRaw
+        .split(/[\r\n,;]+/)
+        .map((s) => s.trim())
+        .filter((s) => s && s !== 'MY_GEMINI_API_KEY');
+      splitList.slice(0, MAX_TTS_KEY_SLOTS).forEach((k, idx) => {
+        map.set(idx + 1, k);
+      });
+    }
+    for (let order = 1; order <= MAX_TTS_KEY_SLOTS; order++) {
+      const raw = process.env[`GEMINI_API_KEY_${order}`];
+      const trimmed = typeof raw === 'string' ? raw.trim() : '';
+      if (trimmed && trimmed !== 'MY_GEMINI_API_KEY') {
+        map.set(order, trimmed);
+      }
+    }
+    return map;
+  }
+
   const ttsKeyVault: StoredTtsApiKey[] = loadTtsVaultFromDisk();
   console.log(`[TTS Vault] Loaded ${ttsKeyVault.length} keys from ${path.basename(TTS_VAULT_FILE)} (model=${TTS_MODEL})`);
   for (const rec of ttsKeyVault) {
@@ -934,6 +965,7 @@ async function startServer() {
     for (const rec of ttsKeyVault) {
       byOrder.set(rec.order, rec);
     }
+    const envSlots = resolveEnvTtsSlotKeys();
     const slots: TtsKeySlotDto[] = [];
     for (let order = 1; order <= MAX_TTS_KEY_SLOTS; order++) {
       const rec = byOrder.get(order);
@@ -946,6 +978,17 @@ async function startServer() {
           status: rec.status,
           lastUsed: rec.lastUsed,
           failCount: rec.failCount,
+          source: 'vault',
+        });
+      } else if (envSlots.has(order)) {
+        slots.push({
+          order,
+          hasKey: true,
+          maskedKey: '****',
+          status: 'active',
+          lastUsed: 0,
+          failCount: 0,
+          source: 'env',
         });
       } else {
         slots.push({
@@ -961,84 +1004,190 @@ async function startServer() {
     return slots;
   }
 
+  function extractHttpStatusFromErrorMsg(msg: string): number {
+    if (msg.includes('429')) return 429;
+    if (msg.includes('401')) return 401;
+    if (msg.includes('403')) return 403;
+    if (msg.includes('404')) return 404;
+    if (msg.includes('503')) return 503;
+    if (msg.includes('400')) return 400;
+    return 500;
+  }
+
+  function classifyTtsError(msg: string): {
+    httpStatus: number;
+    isQuota: boolean;
+    isInvalidAuth: boolean;
+  } {
+    const httpStatus = extractHttpStatusFromErrorMsg(msg);
+    const lower = msg.toLowerCase();
+    const isQuota =
+      httpStatus === 429 ||
+      lower.includes('resource_exhausted') ||
+      lower.includes('quota') ||
+      lower.includes('rate limit');
+    const isInvalidAuth =
+      !isQuota &&
+      (httpStatus === 401 ||
+        httpStatus === 403 ||
+        lower.includes('api_key_invalid') ||
+        lower.includes('api key not valid') ||
+        lower.includes('permission_denied') ||
+        lower.includes('unauthenticated') ||
+        lower.includes('access_token_type_unsupported'));
+    return {httpStatus, isQuota, isInvalidAuth};
+  }
+
   async function callGeminiPreviewTtsWithKey(
     apiKey: string,
     darijaText: string,
     voiceName: LockedVoiceName
   ): Promise<
-    | {ok: true; audioBase64: string; mimeType: string}
-    | {ok: false; httpStatus: number; isQuota: boolean; error: string}
+    | {ok: true; audioBase64: string; mimeType: string; modelName: string}
+    | {ok: false; httpStatus: number; isQuota: boolean; isInvalidAuth: boolean; error: string}
   > {
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': apiKey,
-          },
-          body: JSON.stringify({
-            contents: [{parts: [{text: darijaText}]}],
-            generationConfig: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: {voiceName},
-                },
-              },
-            },
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        const isQuota =
-          response.status === 429 ||
-          errText.includes('RESOURCE_EXHAUSTED') ||
-          errText.toLowerCase().includes('quota');
-        return {
-          ok: false,
-          httpStatus: response.status,
-          isQuota,
-          error: errText.slice(0, 900) || `HTTP ${response.status}`,
-        };
-      }
-
-      const json = (await response.json()) as {
-        candidates?: Array<{
-          content?: {
-            parts?: Array<{
-              inlineData?: {data?: string; mimeType?: string};
-            }>;
-          };
-        }>;
-      };
-      const inlineData = json.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-      if (!inlineData?.data) {
-        return {
-          ok: false,
-          httpStatus: 502,
-          isQuota: false,
-          error: 'No audio inlineData returned',
-        };
-      }
-
-      const rawBuf = Buffer.from(inlineData.data, 'base64');
-      const hasRiffHeader = rawBuf.length >= 4 && rawBuf.slice(0, 4).toString('ascii') === 'RIFF';
-      const wavBuf = hasRiffHeader ? rawBuf : wrapPcm16AsWav(rawBuf, 24000);
-      return {
-        ok: true,
-        audioBase64: wavBuf.toString('base64'),
-        mimeType: 'audio/wav',
-      };
-    } catch (err) {
+    const cleanKey = apiKey.trim();
+    if (!cleanKey || cleanKey === 'MY_GEMINI_API_KEY') {
       return {
         ok: false,
-        httpStatus: 500,
+        httpStatus: 401,
         isQuota: false,
-        error: err instanceof Error ? err.message : String(err),
+        isInvalidAuth: true,
+        error: 'Empty or placeholder API key',
+      };
+    }
+
+    const startedAtMs = Date.now();
+
+    const runModelAttempt = async (
+      modelIndex: number,
+      useVertexAi: boolean,
+      useSpeechMetadata: boolean,
+      useSpeechConfig = true
+    ): Promise<{audioBase64: string; modelName: string}> => {
+      const modelName = TTS_MODELS_TO_TRY[modelIndex];
+      const elapsedMs = Date.now() - startedAtMs;
+      const remainingMs = Math.max(7000, 20000 - elapsedMs);
+
+      const ai = new GoogleGenAI({
+        apiKey: cleanKey,
+        ...(useVertexAi ? {vertexai: true} : {apiVersion: 'v1beta'}),
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
+
+      const partPayload: Record<string, unknown> = {text: darijaText};
+      if (useSpeechMetadata && modelName.startsWith('gemini-3.8-')) {
+        partPayload.speechMetadata = {
+          style: 'Clear, warm, natural Moroccan Darija speaker',
+        };
+      }
+
+      const genConfig: Record<string, unknown> = {
+        responseModalities: ['AUDIO'],
+      };
+      if (useSpeechConfig) {
+        genConfig.speechConfig = {
+          voiceConfig: {
+            prebuiltVoiceConfig: {voiceName},
+          },
+        };
+      }
+
+      try {
+        const response = await Promise.race([
+          ai.models.generateContent({
+            model: modelName,
+            contents: [
+              {
+                role: 'user',
+                parts: [partPayload as {text: string}],
+              },
+            ],
+            config: genConfig,
+          }),
+          new Promise<never>((_resolve, reject) => {
+            setTimeout(() => reject(new Error(`Timeout after ${remainingMs}ms on ${modelName}`)), remainingMs);
+          }),
+        ]);
+
+        const parts = response.candidates?.[0]?.content?.parts || [];
+        const audioPart = parts.find((p) => Boolean(p?.inlineData?.data));
+        const base64Raw = audioPart?.inlineData?.data;
+        if (!base64Raw) {
+          throw new Error(`No audio inlineData returned from ${modelName}`);
+        }
+
+        const rawBuf = Buffer.from(base64Raw, 'base64');
+        const hasRiffHeader =
+          rawBuf.length >= 4 && rawBuf.subarray(0, 4).toString('ascii') === 'RIFF';
+        const wavBuf = hasRiffHeader ? rawBuf : wrapPcm16AsWav(rawBuf, 24000);
+        return {
+          audioBase64: wavBuf.toString('base64'),
+          modelName,
+        };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const lower = errMsg.toLowerCase();
+        const isAuthScopeError =
+          lower.includes('401') ||
+          lower.includes('403') ||
+          lower.includes('api_key_invalid') ||
+          lower.includes('api key not valid') ||
+          lower.includes('unauthenticated') ||
+          lower.includes('access_token_type_unsupported');
+
+        if (!useVertexAi && isAuthScopeError && cleanKey.startsWith('AQ.')) {
+          return runModelAttempt(modelIndex, true, useSpeechMetadata, useSpeechConfig);
+        }
+
+        if (useSpeechMetadata && (lower.includes('speechmetadata') || lower.includes('400'))) {
+          return runModelAttempt(modelIndex, useVertexAi, false, useSpeechConfig);
+        }
+
+        if (useSpeechConfig && (lower.includes('speechconfig') || lower.includes('unknown name'))) {
+          return runModelAttempt(modelIndex, useVertexAi, false, false);
+        }
+
+        const isModelSwitchable =
+          lower.includes('404') ||
+          lower.includes('not_found') ||
+          lower.includes('not found') ||
+          lower.includes('503') ||
+          lower.includes('unavailable') ||
+          lower.includes('overloaded') ||
+          lower.includes('high demand') ||
+          lower.includes('timeout') ||
+          lower.includes('400');
+
+        if (isModelSwitchable && modelIndex + 1 < TTS_MODELS_TO_TRY.length && Date.now() - startedAtMs < 18000) {
+          return runModelAttempt(modelIndex + 1, useVertexAi, true, true);
+        }
+
+        throw new Error(`[${modelName}:v=${useVertexAi}] ${errMsg}`);
+      }
+    };
+
+    try {
+      const okRes = await runModelAttempt(0, false, true, true);
+      return {
+        ok: true,
+        audioBase64: okRes.audioBase64,
+        mimeType: 'audio/wav',
+        modelName: okRes.modelName,
+      };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const classified = classifyTtsError(errMsg);
+      return {
+        ok: false,
+        httpStatus: classified.httpStatus,
+        isQuota: classified.isQuota,
+        isInvalidAuth: classified.isInvalidAuth,
+        error: errMsg.slice(0, 900),
       };
     }
   }
@@ -1049,7 +1198,11 @@ async function startServer() {
       return;
     }
     resetExpiredTtsKeysIf24h();
-    res.json({slots: buildTtsSlotsResponse()});
+    res.json({
+      slots: buildTtsSlotsResponse(),
+      envKeyCount: resolveEnvTtsSlotKeys().size,
+      isServerless: false,
+    });
   });
 
   app.post('/api/admin/tts-keys', (req, res) => {
@@ -1078,7 +1231,6 @@ async function startServer() {
       if (typeof entry.keyInput === 'string') {
         const trimmed = entry.keyInput.trim();
         if (!trimmed || trimmed === '****') {
-          // Leave existing encrypted key untouched
           continue;
         }
         if (trimmed.length < 10 || trimmed.length > 512) {
@@ -1102,14 +1254,19 @@ async function startServer() {
     }
 
     saveTtsVaultToDisk();
-    // Immediately reload keys from disk and clear quotaExhausted cooldown so Google TTS retries right away without restart
     const reloaded = loadTtsVaultFromDisk();
     ttsKeyVault.splice(0, ttsKeyVault.length, ...reloaded);
     ttsAllExhaustedUntilMs = 0;
     ttsRoundRobinCursor = 0;
-    lastUsedKeyOrder = null;
+    ttsCache.clear();
     console.log(`[TTS Vault] Saved & reloaded ${ttsKeyVault.length} keys — quotaExhausted cleared`);
-    res.json({ok: true, quotaCleared: true, slots: buildTtsSlotsResponse()});
+    res.json({
+      ok: true,
+      quotaCleared: true,
+      slots: buildTtsSlotsResponse(),
+      envKeyCount: resolveEnvTtsSlotKeys().size,
+      isServerless: false,
+    });
   });
 
   app.post('/api/admin/tts-keys/hydrate', (req, res) => {
@@ -1143,7 +1300,6 @@ async function startServer() {
       ) {
         continue;
       }
-      // Only hydrate records encrypted by this vault key
       if (!decryptTtsKey(item.encryptedKey)) continue;
       const existing = ttsKeyVault.find((k) => k.order === order);
       if (!existing) {
@@ -1163,12 +1319,18 @@ async function startServer() {
       ttsAllExhaustedUntilMs = 0;
     }
     resetExpiredTtsKeysIf24h();
-    res.json({ok: true, slots: buildTtsSlotsResponse()});
+    res.json({ok: true, slots: buildTtsSlotsResponse(), envKeyCount: resolveEnvTtsSlotKeys().size});
   });
 
   function resolveLockedVoiceName(voiceType?: string, gender?: string): LockedVoiceName {
-    if (voiceType === VOICE_GIRL || gender === 'female') return VOICE_GIRL;
-    if (voiceType === VOICE_BOY || gender === 'male') return VOICE_BOY;
+    if (
+      voiceType === VOICE_GIRL ||
+      voiceType === 'female' ||
+      voiceType === 'girl' ||
+      gender === 'female'
+    ) {
+      return VOICE_GIRL;
+    }
     return VOICE_BOY;
   }
 
@@ -1187,24 +1349,27 @@ async function startServer() {
     };
     const slotOrder = Number(order);
     if (!Number.isInteger(slotOrder) || slotOrder < 1 || slotOrder > MAX_TTS_KEY_SLOTS) {
-      res.status(400).json({ok: false, status: 'exhausted', error: 'رقم المفتاح غير صالح'});
+      res.status(400).json({ok: false, reason: 'no_keys', status: 'active', error: 'رقم المفتاح غير صالح'});
       return;
     }
 
     const storedRecord = ttsKeyVault.find((k) => k.order === slotOrder);
+    const envSlots = resolveEnvTtsSlotKeys();
     const trimmedInput = typeof plainKey === 'string' ? plainKey.trim() : '';
     const usingUnsavedPlain = Boolean(trimmedInput && trimmedInput !== '****');
     const resolvedKey = usingUnsavedPlain
       ? trimmedInput
       : storedRecord
         ? decryptTtsKey(storedRecord.key)
-        : null;
+        : envSlots.get(slotOrder) || null;
 
     if (!resolvedKey) {
-      res.status(400).json({
+      res.status(200).json({
         ok: false,
-        status: 'exhausted',
-        message: 'ما كاينش مفتاح محفوظ فهاد الخانة باش نختابروه.',
+        reason: 'no_keys' as TtsFailureReason,
+        quotaExhausted: false,
+        status: 'active' as TtsKeyStatus,
+        message: '⚠️ ما كاينش مفتاح فهاد الخانة',
         slots: buildTtsSlotsResponse(),
       });
       return;
@@ -1235,20 +1400,32 @@ async function startServer() {
       return;
     }
 
-    if (storedRecord && !usingUnsavedPlain) {
+    if (storedRecord && !usingUnsavedPlain && (result.isQuota || result.isInvalidAuth)) {
       storedRecord.status = 'exhausted';
       storedRecord.failCount += 1;
       storedRecord.lastUsed = nowTs;
       saveTtsVaultToDisk();
     }
 
+    const reason: TtsFailureReason = result.isQuota
+      ? 'quota_exhausted'
+      : result.isInvalidAuth
+        ? 'invalid_key'
+        : 'unavailable';
+
     res.status(200).json({
       ok: false,
-      status: 'exhausted' as TtsKeyStatus,
+      reason,
+      quotaExhausted: result.isQuota,
+      status: (result.isQuota || result.isInvalidAuth ? 'exhausted' : storedRecord?.status ?? 'active') as TtsKeyStatus,
       httpStatus: result.httpStatus,
       voiceName,
       errorDetail: result.error,
-      message: result.isQuota ? '❌ الكوتا عامرة' : `❌ الكوتا عامرة (${result.httpStatus})`,
+      message: result.isQuota
+        ? '❌ الكوتا عامرة'
+        : result.isInvalidAuth
+          ? '❌ مفتاح غير صالح'
+          : `⚠️ تعذر الاتصال (${result.httpStatus})`,
       slots: buildTtsSlotsResponse(),
     });
   });
@@ -1276,137 +1453,200 @@ async function startServer() {
 
     resetExpiredTtsKeysIf24h();
     const sortedVaultKeys = [...ttsKeyVault].sort((a, b) => a.order - b.order);
-    const activeVaultKeys = sortedVaultKeys.filter((k) => k.status !== 'exhausted');
-    const exhaustedVaultKeys = sortedVaultKeys.filter((k) => k.status === 'exhausted');
+    const envSlotMap = resolveEnvTtsSlotKeys();
+    const defaultEnvKey = resolveServerAiApiKey();
 
-    // If all 20 slots are currently in short cooldown (no new keys saved yet), fast-fail to browser fallback
-    if (activeVaultKeys.length === 0 && Date.now() < ttsAllExhaustedUntilMs) {
+    interface CandidateTtsKey {
+      order: number;
+      rawKey: string;
+      vaultRecord?: StoredTtsApiKey;
+      label: string;
+    }
+
+    const seenRawKeys = new Set<string>();
+    const activeCandidates: CandidateTtsKey[] = [];
+    const exhaustedBackupCandidates: CandidateTtsKey[] = [];
+
+    for (const rec of sortedVaultKeys) {
+      const plain = decryptTtsKey(rec.key);
+      if (!plain || seenRawKeys.has(plain)) continue;
+      seenRawKeys.add(plain);
+      const item: CandidateTtsKey = {
+        order: rec.order,
+        rawKey: plain,
+        vaultRecord: rec,
+        label: `key${rec.order}`,
+      };
+      if (rec.status === 'exhausted') {
+        exhaustedBackupCandidates.push(item);
+      } else {
+        activeCandidates.push(item);
+      }
+    }
+
+    for (let order = 1; order <= MAX_TTS_KEY_SLOTS; order++) {
+      const envVal = envSlotMap.get(order);
+      if (!envVal || seenRawKeys.has(envVal)) continue;
+      seenRawKeys.add(envVal);
+      activeCandidates.push({
+        order,
+        rawKey: envVal,
+        label: `env${order}`,
+      });
+    }
+
+    if (defaultEnvKey && !seenRawKeys.has(defaultEnvKey)) {
+      seenRawKeys.add(defaultEnvKey);
+      activeCandidates.push({
+        order: 99,
+        rawKey: defaultEnvKey,
+        label: 'env_default',
+      });
+    }
+
+    const totalConfiguredCount = activeCandidates.length + exhaustedBackupCandidates.length;
+
+    // Crucial: If NO keys exist at all, report no_keys — NEVER report "All API keys quota full"!
+    if (totalConfiguredCount === 0) {
+      ttsAllExhaustedUntilMs = 0;
       res.status(200).json({
         ok: false,
-        quotaExhausted: true,
-        loadedCount: sortedVaultKeys.length,
+        reason: 'no_keys' as TtsFailureReason,
+        quotaExhausted: false,
+        loadedCount: 0,
         voiceName,
+        message: 'ما كاينش مفتاح صوت محفوظ (دخل للإدارة باش تزيد المفاتيح)',
+        errorDetail: 'NO_KEYS_CONFIGURED',
+      });
+      return;
+    }
+
+    // Fast cooldown ONLY if we actually have configured keys AND all active ones hit genuine quota recently
+    if (activeCandidates.length === 0 && Date.now() < ttsAllExhaustedUntilMs) {
+      res.status(200).json({
+        ok: false,
+        reason: 'quota_exhausted' as TtsFailureReason,
+        quotaExhausted: true,
+        loadedCount: totalConfiguredCount,
+        voiceName,
+        message: 'جميع المفاتيح سالات الكوتا ديالهم، خدام بصوت المتصفح',
         errorDetail: 'ALL_KEYS_COOLDOWN',
       });
       return;
     }
 
-    // Rotate starting position across active keys first, then append any exhausted keys as backup
-    // so EVERY saved key (key 1 -> key 2 -> ... -> key 20) is tried on 429/error without stopping early.
     const rotateList = <T,>(arr: T[], cursor: number): T[] => {
       if (arr.length <= 1) return arr;
       const offset = ((cursor % arr.length) + arr.length) % arr.length;
       return [...arr.slice(offset), ...arr.slice(0, offset)];
     };
 
-    const orderedActive = rotateList(activeVaultKeys, ttsRoundRobinCursor);
-    const orderedExhausted = rotateList(exhaustedVaultKeys, ttsRoundRobinCursor);
-    const candidateKeys = [...orderedActive, ...orderedExhausted];
-    let lastErrorDetail = '';
-    const attemptErrors: string[] = [];
+    const candidateQueue: CandidateTtsKey[] = [
+      ...rotateList(activeCandidates, ttsRoundRobinCursor),
+      ...exhaustedBackupCandidates,
+    ];
 
     console.log(
-      `[TTS Rotate] Loaded ${sortedVaultKeys.length} keys (active=${activeVaultKeys.length}, exhausted=${exhaustedVaultKeys.length}), trying ${candidateKeys.length} keys for voice=${voiceName}`
+      `[TTS Rotate] Loaded ${totalConfiguredCount} keys (active=${activeCandidates.length}, backup=${exhaustedBackupCandidates.length}), trying sequentially for voice=${voiceName}`
     );
 
-    if (candidateKeys.length > 0) {
-      let vaultMutated = false;
-      const maxAttempts = Math.min(candidateKeys.length, TTS_MAX_SILENT_RETRIES);
-      ttsRoundRobinCursor = (ttsRoundRobinCursor + 1) % Math.max(1, sortedVaultKeys.length);
+    const attemptErrors: string[] = [];
+    let quotaFailCount = 0;
+    let invalidAuthCount = 0;
+    let vaultMutated = false;
 
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const rec = candidateKeys[attempt];
-        lastUsedKeyOrder = rec.order;
+    for (let idx = 0; idx < candidateQueue.length; idx++) {
+      const candidate = candidateQueue[idx];
+      const attemptRes = await callGeminiPreviewTtsWithKey(candidate.rawKey, darijaText, voiceName);
 
-        const rawKey = decryptTtsKey(rec.key);
-        if (!rawKey) {
-          console.log(`[TTS Rotate] Key ${rec.order}: empty or failed to decrypt`);
-          attemptErrors.push(`key${rec.order}:INVALID_EMPTY`);
-          rec.status = 'exhausted';
-          rec.failCount += 1;
-          rec.lastUsed = Date.now();
+      if (attemptRes.ok) {
+        ttsAllExhaustedUntilMs = 0;
+        if (candidate.vaultRecord) {
+          candidate.vaultRecord.status = 'active';
+          candidate.vaultRecord.failCount = 0;
+          candidate.vaultRecord.lastUsed = Date.now();
           vaultMutated = true;
-          continue;
-        }
-
-        const attemptRes = await callGeminiPreviewTtsWithKey(rawKey, darijaText, voiceName);
-        if (attemptRes.ok) {
-          ttsAllExhaustedUntilMs = 0;
-          rec.status = 'active';
-          rec.failCount = 0;
-          rec.lastUsed = Date.now();
-          saveTtsVaultToDisk();
-
-          const payload = {
-            ok: true,
-            audioBase64: attemptRes.audioBase64,
-            mimeType: attemptRes.mimeType,
-            voiceName,
-            provider: `${TTS_MODEL}-key${rec.order}-${voiceName}`,
-          };
-          if (ttsCache.size >= TTS_MAX_SERVER_CACHE) {
-            const firstKey = ttsCache.keys().next().value;
-            if (firstKey) ttsCache.delete(firstKey);
+          const activeIdx = activeCandidates.findIndex((c) => c.order === candidate.order);
+          if (activeIdx >= 0) {
+            ttsRoundRobinCursor = activeIdx;
           }
-          ttsCache.set(cacheKey, payload);
-          res.json(payload);
-          return;
+        }
+        if (vaultMutated) {
+          saveTtsVaultToDisk();
         }
 
-        const errMsg = `key${rec.order}:${attemptRes.httpStatus}:${attemptRes.error}`;
-        attemptErrors.push(errMsg);
-        lastErrorDetail = attemptErrors.join(' | ');
-        console.log(`[TTS Rotate] Key ${rec.order} quota/http=${attemptRes.httpStatus} — trying next key`);
-        rec.status = 'exhausted';
-        rec.failCount += 1;
-        rec.lastUsed = Date.now();
+        const payload = {
+          ok: true,
+          audioBase64: attemptRes.audioBase64,
+          mimeType: attemptRes.mimeType,
+          voiceName,
+          activeKeyOrder: candidate.order,
+          totalKeys: totalConfiguredCount,
+          provider: `${attemptRes.modelName}-${candidate.label}-${voiceName}`,
+        };
+        if (ttsCache.size >= TTS_MAX_SERVER_CACHE) {
+          const firstKey = ttsCache.keys().next().value;
+          if (firstKey) ttsCache.delete(firstKey);
+        }
+        ttsCache.set(cacheKey, payload);
+        res.json(payload);
+        return;
+      }
+
+      attemptErrors.push(`${candidate.label}:${attemptRes.httpStatus}:${attemptRes.error}`);
+      console.log(
+        `[TTS Rotate] ${candidate.label} failed (http=${attemptRes.httpStatus}, quota=${attemptRes.isQuota}, invalid=${attemptRes.isInvalidAuth}) — rotating to next key`
+      );
+
+      if (attemptRes.isQuota) {
+        quotaFailCount += 1;
+      } else if (attemptRes.isInvalidAuth) {
+        invalidAuthCount += 1;
+      }
+
+      if (candidate.vaultRecord && (attemptRes.isQuota || attemptRes.isInvalidAuth)) {
+        candidate.vaultRecord.status = 'exhausted';
+        candidate.vaultRecord.failCount += 1;
+        candidate.vaultRecord.lastUsed = Date.now();
         vaultMutated = true;
       }
 
-      if (vaultMutated) {
-        saveTtsVaultToDisk();
-      }
+      // Advance cursor past the failing key for subsequent requests
+      ttsRoundRobinCursor = (ttsRoundRobinCursor + 1) % Math.max(1, activeCandidates.length || 1);
     }
 
-    // Backup attempt with server GEMINI_API_KEY (with 1 fast retry on transient 429/503)
-    const defaultEnvKey = process.env.GEMINI_API_KEY;
-    if (defaultEnvKey) {
-      for (let envTry = 0; envTry < 2; envTry++) {
-        const envPreviewRes = await callGeminiPreviewTtsWithKey(defaultEnvKey, darijaText, voiceName);
-        if (envPreviewRes.ok) {
-          ttsAllExhaustedUntilMs = 0;
-          const payload = {
-            ok: true,
-            audioBase64: envPreviewRes.audioBase64,
-            mimeType: envPreviewRes.mimeType,
-            voiceName,
-            provider: `${TTS_MODEL}-env-${voiceName}`,
-          };
-          if (ttsCache.size >= TTS_MAX_SERVER_CACHE) {
-            const firstKey = ttsCache.keys().next().value;
-            if (firstKey) ttsCache.delete(firstKey);
-          }
-          ttsCache.set(cacheKey, payload);
-          res.json(payload);
-          return;
-        }
-        const envErr = `env:${envPreviewRes.httpStatus}:${envPreviewRes.error}`;
-        lastErrorDetail = [lastErrorDetail, envErr].filter(Boolean).join(' | ');
-        if (envTry === 0 && (envPreviewRes.httpStatus === 429 || envPreviewRes.httpStatus === 503)) {
-          await new Promise((r) => setTimeout(r, 700));
-          continue;
-        }
-        break;
-      }
+    if (vaultMutated) {
+      saveTtsVaultToDisk();
     }
 
-    ttsAllExhaustedUntilMs = Date.now() + TTS_ALL_EXHAUSTED_COOLDOWN_MS;
+    const reason: TtsFailureReason =
+      quotaFailCount > 0
+        ? 'quota_exhausted'
+        : invalidAuthCount === candidateQueue.length
+          ? 'invalid_key'
+          : 'unavailable';
+
+    if (reason === 'quota_exhausted') {
+      ttsAllExhaustedUntilMs = Date.now() + TTS_ALL_EXHAUSTED_COOLDOWN_MS;
+    } else {
+      ttsAllExhaustedUntilMs = 0;
+    }
+
+    const message =
+      reason === 'quota_exhausted'
+        ? 'جميع المفاتيح سالات الكوتا ديالهم، خدام بصوت المتصفح'
+        : reason === 'invalid_key'
+          ? 'المفاتيح المدخلة غير صالحة أو مرفوضة من Google'
+          : 'سيرفرات الصوت عامرين دابا، خدام بصوت المتصفح';
+
     res.status(200).json({
       ok: false,
-      quotaExhausted: true,
-      loadedCount: sortedVaultKeys.length,
+      reason,
+      quotaExhausted: reason === 'quota_exhausted',
+      loadedCount: totalConfiguredCount,
       voiceName,
-      errorDetail: lastErrorDetail || 'TTS_UNAVAILABLE',
+      message,
+      errorDetail: attemptErrors.join(' | ') || 'TTS_UNAVAILABLE',
     });
   });
 
@@ -1462,13 +1702,15 @@ async function startServer() {
           httpStatus: 200,
           hasSpaces: /\s/.test(rawKey),
           keyLength: trimmed.length,
-          detail: 'Working with ' + TTS_MODEL,
+          detail: 'Working with ' + testRes.modelName,
         });
       } else {
-        rec.status = 'exhausted';
-        rec.failCount += 1;
-        rec.lastUsed = Date.now();
-        vaultMutated = true;
+        if (testRes.isQuota || testRes.isInvalidAuth) {
+          rec.status = 'exhausted';
+          rec.failCount += 1;
+          rec.lastUsed = Date.now();
+          vaultMutated = true;
+        }
         const state: 'Quota Full' | 'Invalid' = testRes.isQuota ? 'Quota Full' : 'Invalid';
         results.push({
           order: rec.order,
@@ -1477,9 +1719,7 @@ async function startServer() {
           httpStatus: testRes.httpStatus,
           hasSpaces: /\s/.test(rawKey),
           keyLength: trimmed.length,
-          detail: testRes.isQuota
-            ? '429 Quota exceeded (10/day Free Tier limit on gemini-2.5-flash-tts)'
-            : testRes.error.slice(0, 180),
+          detail: testRes.isQuota ? '429 Quota exceeded' : testRes.error.slice(0, 180),
         });
       }
     }

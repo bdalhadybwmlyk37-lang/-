@@ -104,6 +104,8 @@ export interface AccessCodeItem {
 
 export type TtsApiKeyStatus = 'active' | 'exhausted';
 
+export type TtsFailureReason = 'no_keys' | 'invalid_key' | 'quota_exhausted' | 'unavailable';
+
 export interface TtsApiKeySlot {
   order: number;
   hasKey: boolean;
@@ -112,5 +114,6 @@ export interface TtsApiKeySlot {
   status: TtsApiKeyStatus;
   lastUsed: number;
   failCount: number;
+  source?: 'vault' | 'env';
 }
 

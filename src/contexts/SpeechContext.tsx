@@ -11,7 +11,7 @@ import {
   subscribeAudioState,
   toDarija,
 } from '../../voice.js';
-import type {TtsApiKeySlot, TtsApiKeyStatus, UserSettings} from '../types';
+import type {TtsApiKeySlot, TtsApiKeyStatus, TtsFailureReason, UserSettings} from '../types';
 
 export type VoiceType = typeof VOICE_GIRL | typeof VOICE_BOY;
 
@@ -39,6 +39,8 @@ export interface SpeakProResult {
   usedFallback?: boolean;
   browserOnly?: boolean;
   quotaExhausted?: boolean;
+  reason?: TtsFailureReason;
+  loadedCount?: number;
   voiceId?: VoiceType;
   voiceName?: VoiceType;
   status?: TtsApiKeyStatus;
@@ -166,9 +168,18 @@ export const SpeechProvider: React.FC<{children: React.ReactNode}> = ({children}
       if (
         !isAdminKeyTest &&
         options.useCloudTts &&
-        (res.usedFallback || (!res.ok && res.quotaExhausted))
+        (res.usedFallback || (!res.ok && !res.stopped))
       ) {
-        showVoiceToast('All API keys quota full, using browser voice', 'err');
+        const toastText =
+          res.message ||
+          (res.reason === 'no_keys'
+            ? 'ما كاينش مفتاح صوت محفوظ (دخل للإدارة باش تزيد المفاتيح)'
+            : res.reason === 'invalid_key'
+              ? 'مفتاح الصوت غير صالح أو مرفوض من Google'
+              : res.quotaExhausted
+                ? 'جميع المفاتيح سالات الكوتا ديالهم، خدام بصوت المتصفح'
+                : 'تعذر تشغيل الصوت السحابي، خدام بصوت المتصفح');
+        showVoiceToast(toastText, 'err');
       }
 
       return res;
@@ -218,9 +229,18 @@ export const SpeechProvider: React.FC<{children: React.ReactNode}> = ({children}
       setIsConfirmingVoice(false);
 
       if (useCloudTts && (res.usedFallback || !res.ok)) {
-        showVoiceToast('All API keys quota full, using browser voice', 'err');
+        const toastText =
+          res.message ||
+          (res.reason === 'no_keys'
+            ? 'ما كاينش مفتاح صوت محفوظ (دخل للإدارة باش تزيد المفاتيح)'
+            : res.reason === 'invalid_key'
+              ? 'مفتاح الصوت غير صالح أو مرفوض من Google'
+              : res.quotaExhausted
+                ? 'جميع المفاتيح سالات الكوتا ديالهم، خدام بصوت المتصفح'
+                : 'تعذر تشغيل الصوت السحابي، خدام بصوت المتصفح');
+        showVoiceToast(toastText, 'err');
       } else {
-        showVoiceToast('Voice saved', 'ok');
+        showVoiceToast('تم حفظ الصوت', 'ok');
       }
 
       return choice;

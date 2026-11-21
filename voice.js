@@ -667,7 +667,7 @@ export async function callTTS(text, voiceId, options = {}) {
     }
   }
 
-  // Fast-path browser fallback while server keys are known quota-exhausted (cleared immediately when admin saves new keys)
+  // Fast-path browser fallback ONLY while server keys genuinely hit quota (cleared immediately when admin saves new keys)
   if (!isAdminKeyTest && !options.noFallback && isQuotaExhausted()) {
     const fallbackPlayed = await speakWithBrowserFallback(
       darijaText,
@@ -680,10 +680,11 @@ export async function callTTS(text, voiceId, options = {}) {
       ok: fallbackPlayed,
       usedFallback: true,
       quotaExhausted: true,
+      reason: 'quota_exhausted',
       voiceId: resolvedVoiceId,
       voiceName: resolvedVoiceId,
       status: 'exhausted',
-      message: 'All API keys quota full, using browser voice',
+      message: 'جميع المفاتيح سالات الكوتا ديالهم، خدام بصوت المتصفح',
     };
   }
 
@@ -725,7 +726,7 @@ export async function callTTS(text, voiceId, options = {}) {
 
     const data = await res.json().catch(() => ({}));
 
-    if (res.ok && data.audioBase64) {
+    if (res.ok && data.ok && data.audioBase64) {
       clearQuotaExhausted();
       const mime = data.mimeType || 'audio/wav';
       saveToAllCaches(cacheKey, data.audioBase64, mime);
@@ -743,13 +744,38 @@ export async function callTTS(text, voiceId, options = {}) {
       }
     }
 
+    const resolvedReason =
+      data.reason ||
+      (data.loadedCount === 0 && !data.quotaExhausted
+        ? 'no_keys'
+        : data.quotaExhausted === true || res.status === 429
+          ? 'quota_exhausted'
+          : 'unavailable');
+
+    const isGenuineQuota = resolvedReason === 'quota_exhausted';
+
+    const resolvedMessage =
+      data.message ||
+      (resolvedReason === 'no_keys'
+        ? 'ما كاينش مفتاح صوت محفوظ (دخل للإدارة باش تزيد المفاتيح)'
+        : resolvedReason === 'invalid_key'
+          ? 'مفتاح الصوت غير صالح أو مرفوض من Google'
+          : isGenuineQuota
+            ? 'جميع المفاتيح سالات الكوتا ديالهم، خدام بصوت المتصفح'
+            : 'تعذر تشغيل الصوت السحابي، خدام بصوت المتصفح');
+
     if (data.errorDetail) {
-      console.info(`[voice.js] Gemini TTS unavailable (${resolvedVoiceId}), using browser fallback`);
+      console.info(`[voice.js] Gemini TTS (${resolvedReason}): ${data.errorDetail}`);
     }
 
     if (!isAdminKeyTest) {
-      quotaExhausted = true;
-      quotaExhaustedAt = Date.now();
+      if (isGenuineQuota) {
+        quotaExhausted = true;
+        quotaExhaustedAt = Date.now();
+      } else {
+        quotaExhausted = false;
+        quotaExhaustedAt = 0;
+      }
     }
 
     if (!isAdminKeyTest && !options.noFallback) {
@@ -763,11 +789,13 @@ export async function callTTS(text, voiceId, options = {}) {
       return {
         ok: fallbackPlayed,
         usedFallback: true,
-        quotaExhausted: true,
+        quotaExhausted: isGenuineQuota,
+        reason: resolvedReason,
+        loadedCount: data.loadedCount,
         voiceId: resolvedVoiceId,
         voiceName: resolvedVoiceId,
-        status: data.status ?? 'exhausted',
-        message: 'All API keys quota full, using browser voice',
+        status: data.status ?? (isGenuineQuota ? 'exhausted' : 'active'),
+        message: resolvedMessage,
         slots: data.slots,
         errorDetail: data.errorDetail,
       };
@@ -780,11 +808,13 @@ export async function callTTS(text, voiceId, options = {}) {
     return {
       ok: false,
       usedFallback: false,
-      quotaExhausted: true,
+      quotaExhausted: isGenuineQuota,
+      reason: resolvedReason,
+      loadedCount: data.loadedCount,
       voiceId: resolvedVoiceId,
       voiceName: resolvedVoiceId,
-      status: data.status ?? 'exhausted',
-      message: data.message,
+      status: data.status ?? (isGenuineQuota ? 'exhausted' : 'active'),
+      message: resolvedMessage,
       slots: data.slots,
       errorDetail: data.errorDetail,
     };
@@ -804,11 +834,12 @@ export async function callTTS(text, voiceId, options = {}) {
       return {
         ok: fallbackPlayed,
         usedFallback: true,
-        quotaExhausted: true,
+        quotaExhausted: false,
+        reason: 'unavailable',
         voiceId: resolvedVoiceId,
         voiceName: resolvedVoiceId,
-        status: 'exhausted',
-        message: 'All API keys quota full, using browser voice',
+        status: 'active',
+        message: 'تعذر الاتصال بسيرفر الصوت، خدام بصوت المتصفح',
         errorDetail: err instanceof Error ? err.message : String(err),
       };
     }
@@ -818,9 +849,12 @@ export async function callTTS(text, voiceId, options = {}) {
     return {
       ok: false,
       usedFallback: false,
+      quotaExhausted: false,
+      reason: 'unavailable',
       voiceId: resolvedVoiceId,
       voiceName: resolvedVoiceId,
-      status: 'exhausted',
+      status: 'active',
+      message: 'تعذر الاتصال بسيرفر الصوت',
       errorDetail: err instanceof Error ? err.message : String(err),
     };
   }

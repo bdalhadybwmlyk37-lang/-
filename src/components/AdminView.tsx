@@ -78,6 +78,7 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
   const [ttsRevealed, setTtsRevealed] = useState<Record<number, boolean>>({});
   const [ttsTestingOrder, setTtsTestingOrder] = useState<number | null>(null);
   const [ttsTestedStatus, setTtsTestedStatus] = useState<Record<number, TtsApiKeyStatus | undefined>>({});
+  const [ttsTestedLabel, setTtsTestedLabel] = useState<Record<number, string | undefined>>({});
   const [ttsSavingKeys, setTtsSavingKeys] = useState(false);
   const [ttsKeyError, setTtsKeyError] = useState<string | null>(null);
 
@@ -218,9 +219,18 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
   };
 
   const handleTestTtsKey = async (order: number) => {
-    setTtsTestingOrder(order);
     setTtsKeyError(null);
     const typed = (ttsInputs[order] || '').trim();
+    const slotInfo = ttsSlots.find((s) => s.order === order);
+    const hasSaved = Boolean(slotInfo?.hasKey);
+
+    if (!typed && !hasSaved) {
+      setTtsTestedLabel((prev) => ({...prev, [order]: '⚠️ ما كاينش مفتاح'}));
+      showToast(`مفتاح ${order}: ⚠️ ما كاينش مفتاح`);
+      return;
+    }
+
+    setTtsTestingOrder(order);
     const plainToTest = typed && typed !== '****' ? typed : undefined;
 
     try {
@@ -232,25 +242,35 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
         adminPin: ADMIN_PIN,
       });
 
-      const nextStatus: TtsApiKeyStatus =
-        result.ok || result.status === 'active' ? 'active' : 'exhausted';
-      if (nextStatus === 'active') {
+      if (result.reason === 'no_keys') {
+        setTtsTestedLabel((prev) => ({...prev, [order]: '⚠️ ما كاينش مفتاح'}));
+        showToast(`مفتاح ${order}: ⚠️ ما كاينش مفتاح`);
+      } else if (result.ok || result.status === 'active') {
         clearQuotaExhausted();
+        setTtsTestedStatus((prev) => ({...prev, [order]: 'active'}));
+        setTtsTestedLabel((prev) => ({...prev, [order]: '✅ شغال'}));
+        showToast(`مفتاح ${order}: ✅ شغال مزيان`);
+      } else {
+        const failLabel =
+          result.reason === 'invalid_key'
+            ? '❌ مفتاح غير صالح'
+            : result.reason === 'quota_exhausted'
+              ? '❌ الكوتا عامرة'
+              : result.message || '⚠️ تعذر الاتصال';
+        setTtsTestedStatus((prev) => ({...prev, [order]: 'exhausted'}));
+        setTtsTestedLabel((prev) => ({...prev, [order]: failLabel}));
+        showToast(`مفتاح ${order}: ${failLabel}`);
       }
-      setTtsTestedStatus((prev) => ({...prev, [order]: nextStatus}));
+
       if (Array.isArray(result.slots)) {
         setTtsSlots(result.slots);
         if (user) {
           await syncTtsApiKeysToFirestore(user, result.slots).catch(() => undefined);
         }
       }
-      showToast(
-        nextStatus === 'active'
-          ? `مفتاح ${order}: ✅ شغال مزيان`
-          : `مفتاح ${order}: ❌ الكوتا عامرة أو غير شغال`
-      );
     } catch {
       setTtsTestedStatus((prev) => ({...prev, [order]: 'exhausted'}));
+      setTtsTestedLabel((prev) => ({...prev, [order]: '⚠️ وقع خطأ فالاختبار'}));
       setTtsKeyError(`وقع خطأ فاختبار مفتاح ${order}`);
     } finally {
       setTtsTestingOrder(null);
@@ -283,6 +303,8 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
         ok?: boolean;
         error?: string;
         slots?: TtsApiKeySlot[];
+        envKeyCount?: number;
+        isServerless?: boolean;
       };
       if (!res.ok || !Array.isArray(data.slots)) {
         setTtsKeyError(data.error || 'تعذر حفظ مفاتيح الصوت.');
@@ -297,6 +319,8 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
       setTtsSlots(data.slots);
       setTtsInputs(nextInputs);
       setTtsRevealed({});
+      setTtsTestedStatus({});
+      setTtsTestedLabel({});
       clearQuotaExhausted();
 
       if (user) {
@@ -305,6 +329,12 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
         } catch {
           setTtsKeyError('تم الحفظ مشفر فالسيرفر، ولكن تأكد بلي داخل بحساب الأدمن لمزامنة Firestore.');
         }
+      }
+
+      if (data.isServerless && !data.envKeyCount) {
+        setTtsKeyError(
+          'تم الحفظ فهاد المتصفح مؤقتاً. باش يخدمو المفاتيح عند جميع الناس فـ Vercel ديما، زيدهم فـ Environment Variables (GEMINI_TTS_KEYS أو GEMINI_API_KEY_1..20).'
+        );
       }
 
       showToast('تم حفظ وتشفير مفاتيح الصوت بنجاح 🔐');
@@ -746,6 +776,7 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
                   onClick={() =>
                     void speakPro('مرحبا بيك ف فاهم بلان، أنا سلمى المهندسة.', VOICE_GIRL, {
                       id: 'admin-quick-girl',
+                      useCloudTts: true,
                     })
                   }
                   className="min-h-[36px] inline-flex items-center gap-1.5 rounded-lg border border-pink-400/40 bg-pink-500/15 px-3 py-1.5 text-xs font-bold text-pink-200 hover:bg-pink-500/25"
@@ -761,6 +792,7 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
                   onClick={() =>
                     void speakPro('مرحبا بيك أخويا ف فاهم بلان، أنا المعلم.', VOICE_BOY, {
                       id: 'admin-quick-boy',
+                      useCloudTts: true,
                     })
                   }
                   className="min-h-[36px] inline-flex items-center gap-1.5 rounded-lg border border-sky-400/40 bg-sky-500/15 px-3 py-1.5 text-xs font-bold text-sky-200 hover:bg-sky-500/25"
@@ -873,7 +905,19 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
                     </div>
 
                     <div className="min-h-[20px] flex items-center justify-between text-xs">
-                      {displayStatus === 'active' ? (
+                      {ttsTestedLabel[order] ? (
+                        <span
+                          className={`font-bold ${
+                            displayStatus === 'active'
+                              ? 'text-emerald-400'
+                              : ttsTestedLabel[order]?.includes('ما كاينش')
+                                ? 'text-amber-300'
+                                : 'text-red-400'
+                          }`}
+                        >
+                          {ttsTestedLabel[order]}
+                        </span>
+                      ) : displayStatus === 'active' ? (
                         <span className="font-bold text-emerald-400">✅ شغال</span>
                       ) : displayStatus === 'exhausted' ? (
                         <span className="font-bold text-red-400">❌ الكوتا عامرة</span>
@@ -882,7 +926,9 @@ export const AdminView: React.FC<AdminViewProps> = ({user, cloudCodes, onBack}) 
                       )}
                       {slot.hasKey && (
                         <span className="text-[11px] text-slate-400">
-                          محفوظ مشفر · مسح الخانة والحفظ يحذفه
+                          {slot.source === 'env'
+                            ? 'محفوظ فالسيرفر (Vercel Env)'
+                            : 'محفوظ مشفر · مسح الخانة والحفظ يحذفه'}
                         </span>
                       )}
                     </div>

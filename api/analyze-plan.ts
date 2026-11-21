@@ -159,7 +159,7 @@ export async function POST(request: Request): Promise<Response> {
       .join('\n\n');
 
     const ai = new GoogleGenAI({apiKey});
-    const models = ['gemini-2.5-flash'];
+    const models = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.0-flash'];
     let lastError: unknown = null;
 
     for (const model of models) {

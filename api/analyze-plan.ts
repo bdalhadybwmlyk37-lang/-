@@ -1,4 +1,4 @@
-import {GoogleGenAI, Type} from '@google/genai';
+ import {GoogleGenAI, Type} from '@google/genai';
 
 type ApiRequest = {
   method?: string;
@@ -200,23 +200,32 @@ async function parseRequestBody(
   }
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_resolve, reject) => {
+      setTimeout(() => reject(new Error(timeoutMessage)), ms);
+    }),
+  ]);
+}
+
 export default async function handler(req: ApiRequest, res: ApiResponse): Promise<void> {
-  setCorsHeaders(res);
-
-  if (req.method === 'OPTIONS') {
-    res.status(200).json({ok: true});
-    return;
-  }
-
-  if (req.method !== 'POST') {
-    res.status(405).json({
-      success: false,
-      error: 'الطريقة غير مسموح بها، استعمل POST.',
-    });
-    return;
-  }
-
   try {
+    setCorsHeaders(res);
+
+    if (req.method === 'OPTIONS') {
+      res.status(200).json({ok: true});
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({
+        success: false,
+        error: 'الطريقة غير مسموح بها، استعمل POST.',
+      });
+      return;
+    }
+
     const apiKey = resolveApiKey();
     if (!apiKey) {
       res.status(503).json({
@@ -244,7 +253,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
       return;
     }
 
-    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,[STRIPPED], '');
+    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
     if (!cleanBase64) {
       res.status(400).json({
         success: false,
@@ -276,22 +285,31 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
     const systemInstructionText =
       'أنت معلم بناء ومهندس مغربي كتجاوب 100% بالدارجة المغربية الصافية والمفهومة، وممنوع نهائياً تكتب أي كلمة بالفرنسية أو الإنجليزية أو الترجمة الحرفية بحال béton أو dalle أو ferraillage أو diamètre أو salon أو cuisine أو R+1 — استعمل غير الكلمات المغربية العربية (الضالة، السواري، الكمرة، السوميلة، الحديد، البار، القطر، السنتيم، الصالون، الكوزينة، البيت، السيما، الرملة، الكياس). إلا كانت الصورة ماشي بلان ديال البناء أو الحديد (مثلاً وجه إنسان، طريق، طابلة، حيط خاوي...)، ضروري ترد isBlueprint=false وتكتب بالضبط: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".';
 
-    const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+    const modelsToTry = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+    const startedAtMs = Date.now();
 
     const runAttempt = async (modelIndex: number): Promise<string> => {
       const modelName = modelsToTry[modelIndex];
+      const elapsedMs = Date.now() - startedAtMs;
+      const remainingMs = Math.max(2500, 8500 - elapsedMs);
+
       try {
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: {
-            parts: [{inlineData: {mimeType: safeMime, data: cleanBase64}}, {text: promptText}],
-          },
-          config: {
-            systemInstruction: systemInstructionText,
-            responseMimeType: 'application/json',
-            responseSchema: PLAN_RESPONSE_SCHEMA,
-          },
-        });
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model: modelName,
+            contents: {
+              parts: [{inlineData: {mimeType: safeMime, data: cleanBase64}}, {text: promptText}],
+            },
+            config: {
+              systemInstruction: systemInstructionText,
+              responseMimeType: 'application/json',
+              responseSchema: PLAN_RESPONSE_SCHEMA,
+            },
+          }),
+          remainingMs,
+          '503 timeout waiting for model'
+        );
+
         const text = response.text;
         if (!text) {
           throw new Error('رد فارغ من الذكاء الاصطناعي، عاود حاول.');
@@ -305,11 +323,15 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
           lowerMsg.includes('unavailable') ||
           lowerMsg.includes('overloaded') ||
           lowerMsg.includes('high demand') ||
+          lowerMsg.includes('timeout') ||
           lowerMsg.includes('429') ||
           lowerMsg.includes('resource_exhausted') ||
           lowerMsg.includes('404') ||
-          lowerMsg.includes('not_found');
-        if (isSwitchable && modelIndex + 1 < modelsToTry.length) {
+          lowerMsg.includes('not_found') ||
+          lowerMsg.includes('400');
+
+        const canTryNext = modelIndex + 1 < modelsToTry.length && Date.now() - startedAtMs < 6500;
+        if (isSwitchable && canTryNext) {
           return runAttempt(modelIndex + 1);
         }
         throw attemptErr;
@@ -328,10 +350,13 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
     res.status(200).json({success: true, ...parsed});
   } catch (err) {
     const rawMsg = err instanceof Error ? err.message : 'تعذر تحليل البلان، عاود حاول';
+    const lower = rawMsg.toLowerCase();
     const isOverloaded =
       rawMsg.includes('503') ||
-      rawMsg.toLowerCase().includes('overloaded') ||
-      rawMsg.toLowerCase().includes('high demand');
+      lower.includes('overloaded') ||
+      lower.includes('high demand') ||
+      lower.includes('unavailable') ||
+      lower.includes('timeout');
     res.status(isOverloaded ? 503 : 500).json({
       success: false,
       error: isOverloaded

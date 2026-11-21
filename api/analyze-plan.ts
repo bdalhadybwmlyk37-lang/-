@@ -1,4 +1,4 @@
-import {GoogleGenAI, ThinkingLevel, Type} from '@google/genai';
+import {GoogleGenAI, Type} from '@google/genai';
 
 const PLAN_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
@@ -159,7 +159,7 @@ export async function POST(request: Request): Promise<Response> {
       .join('\n\n');
 
     const ai = new GoogleGenAI({apiKey});
-    const models = ['gemini-2.5-flash', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+    const models = ['gemini-2.5-flash'];
     let lastError: unknown = null;
 
     for (const model of models) {
@@ -174,7 +174,6 @@ export async function POST(request: Request): Promise<Response> {
               'أنت معلم بناء ومهندس مغربي كتجاوب 100% بالدارجة المغربية الصافية والمفهومة، وممنوع نهائياً تكتب أي كلمة بالفرنسية أو الإنجليزية أو الترجمة الحرفية بحال béton أو dalle أو ferraillage أو diamètre أو salon أو cuisine أو R+1 — استعمل غير الكلمات المغربية العربية (الضالة، السواري، الكمرة، السوميلة، الحديد، البار، القطر، السنتيم، الصالون، الكوزينة، البيت، السيما، الرملة، الكياس). إلا كانت الصورة ماشي بلان ديال البناء أو الحديد (مثلاً وجه إنسان، طريق، طابلة، حيط خاوي...)، ضروري ترد isBlueprint=false وتكتب بالضبط: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".',
             responseMimeType: 'application/json',
             responseSchema: PLAN_RESPONSE_SCHEMA,
-            thinkingConfig: {thinkingLevel: ThinkingLevel.MINIMAL},
           },
         });
         const text = response.text;

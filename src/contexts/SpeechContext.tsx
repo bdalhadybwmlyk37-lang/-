@@ -27,6 +27,7 @@ export interface SpeakProOptions {
   voiceId?: VoiceType;
   voiceType?: VoiceType;
   forcePlay?: boolean;
+  useCloudTts?: boolean;
   testOrder?: number;
   testPlainKey?: string;
   adminPin?: string;
@@ -36,6 +37,7 @@ export interface SpeakProResult {
   ok: boolean;
   stopped?: boolean;
   usedFallback?: boolean;
+  browserOnly?: boolean;
   quotaExhausted?: boolean;
   voiceId?: VoiceType;
   voiceName?: VoiceType;
@@ -53,8 +55,13 @@ interface SpeechContextValue {
   activeSpeechId: string | null;
   previewVoice: 'girl' | 'boy' | null;
   isConfirmingVoice: boolean;
-  previewVoiceSelection: (choice: 'girl' | 'boy', previewText: string, id: string) => void;
-  confirmVoiceSelection: () => Promise<'girl' | 'boy' | null>;
+  previewVoiceSelection: (
+    choice: 'girl' | 'boy',
+    previewText: string,
+    id: string,
+    useCloudTts?: boolean
+  ) => void;
+  confirmVoiceSelection: (useCloudTts?: boolean) => Promise<'girl' | 'boy' | null>;
   speakPro: (
     text: string,
     voiceTypeOrOptions?: VoiceType | SpeakProOptions,
@@ -156,7 +163,11 @@ export const SpeechProvider: React.FC<{children: React.ReactNode}> = ({children}
         speechRate: settings.speechRate,
       })) as SpeakProResult;
 
-      if (!isAdminKeyTest && (res.usedFallback || (!res.ok && res.quotaExhausted))) {
+      if (
+        !isAdminKeyTest &&
+        options.useCloudTts &&
+        (res.usedFallback || (!res.ok && res.quotaExhausted))
+      ) {
         showVoiceToast('All API keys quota full, using browser voice', 'err');
       }
 
@@ -166,51 +177,56 @@ export const SpeechProvider: React.FC<{children: React.ReactNode}> = ({children}
   );
 
   const previewVoiceSelection = useCallback(
-    (choice: 'girl' | 'boy', previewText: string, id: string) => {
+    (choice: 'girl' | 'boy', previewText: string, id: string, useCloudTts = false) => {
       const changingPreview = previewVoice !== choice;
       setPreviewVoice(choice);
       const voiceId = choice === 'girl' ? PREVIEW_GIRL_VOICE_ID : PREVIEW_BOY_VOICE_ID;
       void speakPro(previewText, voiceId, {
         id,
         forcePlay: changingPreview,
+        useCloudTts,
       });
     },
     [previewVoice, speakPro]
   );
 
-  const confirmVoiceSelection = useCallback(async (): Promise<'girl' | 'boy' | null> => {
-    const choice = previewVoice;
-    if (!choice || isConfirmingVoice) return null;
+  const confirmVoiceSelection = useCallback(
+    async (useCloudTts = false): Promise<'girl' | 'boy' | null> => {
+      const choice = previewVoice;
+      if (!choice || isConfirmingVoice) return null;
 
-    setIsConfirmingVoice(true);
-    try {
-      localStorage.setItem(SELECTED_VOICE_KEY, choice);
-    } catch {
-      // ignore
-    }
+      setIsConfirmingVoice(true);
+      try {
+        localStorage.setItem(SELECTED_VOICE_KEY, choice);
+      } catch {
+        // ignore
+      }
 
-    const nextGender: 'male' | 'female' = choice === 'girl' ? 'female' : 'male';
-    updateSettings({voiceGender: nextGender, voiceEnabled: true});
-    setPreviewVoice(null);
+      const nextGender: 'male' | 'female' = choice === 'girl' ? 'female' : 'male';
+      updateSettings({voiceGender: nextGender, voiceEnabled: true});
+      setPreviewVoice(null);
 
-    const confirmText = choice === 'girl' ? 'تم اختيار صوت البنت' : 'تم اختيار صوت الولد';
-    // Call speak() WITHOUT any hardcoded voiceId so it uses getVoiceId() (API or browser fallback)
-    const res = (await speak(confirmText, {
-      id: `confirm-${choice}`,
-      forcePlay: true,
-      speechRate: settings.speechRate,
-    })) as SpeakProResult;
+      const confirmText = choice === 'girl' ? 'تم اختيار صوت البنت' : 'تم اختيار صوت الولد';
+      // Call speak() WITHOUT any hardcoded voiceId so it uses getVoiceId() (API or browser fallback)
+      const res = (await speak(confirmText, {
+        id: `confirm-${choice}`,
+        forcePlay: true,
+        useCloudTts,
+        speechRate: settings.speechRate,
+      })) as SpeakProResult;
 
-    setIsConfirmingVoice(false);
+      setIsConfirmingVoice(false);
 
-    if (res.usedFallback || !res.ok) {
-      showVoiceToast('All API keys quota full, using browser voice', 'err');
-    } else {
-      showVoiceToast('Voice saved', 'ok');
-    }
+      if (useCloudTts && (res.usedFallback || !res.ok)) {
+        showVoiceToast('All API keys quota full, using browser voice', 'err');
+      } else {
+        showVoiceToast('Voice saved', 'ok');
+      }
 
-    return choice;
-  }, [isConfirmingVoice, previewVoice, settings.speechRate, showVoiceToast, updateSettings]);
+      return choice;
+    },
+    [isConfirmingVoice, previewVoice, settings.speechRate, showVoiceToast, updateSettings]
+  );
 
   return (
     <SpeechContext.Provider
@@ -254,7 +270,10 @@ export function useDarijaSpeech() {
   return ctx;
 }
 
-export const VoiceGenderSwitch: React.FC<{className?: string}> = ({className = ''}) => {
+export const VoiceGenderSwitch: React.FC<{className?: string; useCloudTts?: boolean}> = ({
+  className = '',
+  useCloudTts = false,
+}) => {
   const {
     settings,
     previewVoice,
@@ -276,7 +295,8 @@ export const VoiceGenderSwitch: React.FC<{className?: string}> = ({className = '
           previewVoiceSelection(
             'boy',
             'مرحبا بيك أخويا ف فاهم بلان، كيداير؟ صوت الولد المعلم خدام دابا.',
-            'gender-switch-male'
+            'gender-switch-male',
+            useCloudTts
           )
         }
         className={`min-h-[36px] px-2.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
@@ -293,7 +313,8 @@ export const VoiceGenderSwitch: React.FC<{className?: string}> = ({className = '
           previewVoiceSelection(
             'girl',
             'مرحبا بيك ف فاهم بلان، كيداير؟ أنا سلمى المهندسة، صوت البنت خدام دابا.',
-            'gender-switch-female'
+            'gender-switch-female',
+            useCloudTts
           )
         }
         className={`min-h-[36px] px-2.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap ${
@@ -308,7 +329,7 @@ export const VoiceGenderSwitch: React.FC<{className?: string}> = ({className = '
         <button
           type="button"
           disabled={isConfirmingVoice}
-          onClick={() => void confirmVoiceSelection()}
+          onClick={() => void confirmVoiceSelection(useCloudTts)}
           title="Confirm Selection"
           aria-label="Confirm Selection"
           className="min-h-[36px] px-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-[#0a0f1e] text-xs font-extrabold transition-colors whitespace-nowrap"
@@ -327,6 +348,7 @@ interface SpeakButtonProps {
   compact?: boolean;
   variant?: 'primary' | 'secondary' | 'ghost';
   className?: string;
+  useCloudTts?: boolean;
 }
 
 export const SpeakButton: React.FC<SpeakButtonProps> = ({
@@ -336,6 +358,7 @@ export const SpeakButton: React.FC<SpeakButtonProps> = ({
   compact = false,
   variant = 'secondary',
   className = '',
+  useCloudTts = false,
 }) => {
   const {speakPro, stop, isSpeaking, isLoadingAudio, activeSpeechId, settings} = useDarijaSpeech();
   const isThisActive = isSpeaking && activeSpeechId === id;
@@ -345,7 +368,7 @@ export const SpeakButton: React.FC<SpeakButtonProps> = ({
     if (isThisActive || isThisLoading) {
       stop();
     } else {
-      void speakPro(text, {id});
+      void speakPro(text, {id, useCloudTts});
     }
   };
 

@@ -1,4 +1,4 @@
-import React, {useEffect, useRef, useState} from 'react';
+ import React, {useEffect, useRef, useState} from 'react';
 import {motion} from 'motion/react';
 import {
   AlertCircle,
@@ -133,14 +133,20 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
   const [micVadStatus, setMicVadStatus] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement | null>(null);
-  const recognitionRef = useRef<{stop: () => void} | null>(null);
+  const recognitionRef = useRef<{
+    onresult: ((ev: unknown) => void) | null;
+    onspeechend?: (() => void) | null;
+    onerror: ((ev: unknown) => void) | null;
+    onend: (() => void) | null;
+    stop: () => void;
+    abort?: () => void;
+  } | null>(null);
   const silenceTimerRef = useRef<number | null>(null);
-  const vadRafRef = useRef<number | null>(null);
-  const vadStreamRef = useRef<MediaStream | null>(null);
-  const vadAudioCtxRef = useRef<AudioContext | null>(null);
   const liveTranscriptRef = useRef<string>('');
   const hasSpokenRef = useRef<boolean>(false);
   const autoSentRef = useRef<boolean>(false);
+  const manualStopRef = useRef<boolean>(false);
+  const recognitionErrorHandledRef = useRef<boolean>(false);
   const handleSendChatRef = useRef<(q?: string) => Promise<void>>(async () => undefined);
 
   useEffect(() => {
@@ -350,36 +356,32 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     handleSendChatRef.current = handleSendChat;
   });
 
+  const SILENCE_AUTO_SEND_MS = 1500;
+
   const cleanupMicVad = () => {
     if (silenceTimerRef.current !== null) {
       window.clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
-    if (vadRafRef.current !== null) {
-      cancelAnimationFrame(vadRafRef.current);
-      vadRafRef.current = null;
-    }
     if (recognitionRef.current) {
+      const activeRec = recognitionRef.current;
+      recognitionRef.current = null;
+      activeRec.onresult = null;
+      activeRec.onspeechend = null;
+      activeRec.onerror = null;
+      activeRec.onend = null;
       try {
-        recognitionRef.current.stop();
+        activeRec.stop();
       } catch {
         // ignore
       }
-      recognitionRef.current = null;
-    }
-    if (vadStreamRef.current) {
-      vadStreamRef.current.getTracks().forEach((t) => t.stop());
-      vadStreamRef.current = null;
-    }
-    if (vadAudioCtxRef.current) {
-      vadAudioCtxRef.current.close().catch(() => undefined);
-      vadAudioCtxRef.current = null;
     }
     setIsListeningMic(false);
   };
 
   useEffect(() => {
     return () => {
+      manualStopRef.current = true;
       cleanupMicVad();
     };
   }, []);
@@ -390,30 +392,45 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     autoSentRef.current = true;
     cleanupMicVad();
     if (finalText) {
-      setMicVadStatus('تم التقاط السكوت (1.5ث) — كيتصيفط سؤالك أوتوماتيكياً...');
+      setMicVadStatus(`سمعتك وسكتي 1.5ث — كيتصيفط: "${finalText}"`);
       setChatInput('');
       liveTranscriptRef.current = '';
       void handleSendChatRef.current(finalText);
-      setTimeout(() => setMicVadStatus(null), 1600);
+      window.setTimeout(() => setMicVadStatus(null), 1800);
     } else {
       setMicVadStatus(null);
     }
   };
 
   const scheduleSilenceAutoSend = () => {
-    if (!hasSpokenRef.current || autoSentRef.current) return;
+    if (!hasSpokenRef.current || autoSentRef.current || !liveTranscriptRef.current.trim()) return;
     if (silenceTimerRef.current !== null) {
       window.clearTimeout(silenceTimerRef.current);
     }
     silenceTimerRef.current = window.setTimeout(() => {
       triggerAutoSendAfterSilence();
-    }, 1500);
+    }, SILENCE_AUTO_SEND_MS);
   };
 
-  const toggleVoiceQuestion = async () => {
+  const toggleVoiceQuestion = () => {
+    type SpeechRecInstance = {
+      lang: string;
+      continuous: boolean;
+      interimResults: boolean;
+      maxAlternatives?: number;
+      onresult: ((ev: {results: ArrayLike<ArrayLike<{transcript?: string}>>}) => void) | null;
+      onspeechend?: (() => void) | null;
+      onerror: ((ev: {error?: string}) => void) | null;
+      onend: (() => void) | null;
+      start: () => void;
+      stop: () => void;
+      abort?: () => void;
+    };
+
     const SR =
-      (window as unknown as {SpeechRecognition?: new () => unknown}).SpeechRecognition ||
-      (window as unknown as {webkitSpeechRecognition?: new () => unknown}).webkitSpeechRecognition;
+      (window as unknown as {SpeechRecognition?: new () => SpeechRecInstance}).SpeechRecognition ||
+      (window as unknown as {webkitSpeechRecognition?: new () => SpeechRecInstance})
+        .webkitSpeechRecognition;
 
     if (!SR) {
       setErrorMsg('المتصفح ما كيدعمش الميكروفون التلقائي، كتب سؤالك هنا.');
@@ -421,10 +438,12 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     }
 
     if (isListeningMic) {
+      manualStopRef.current = true;
       const pending = liveTranscriptRef.current.trim();
       cleanupMicVad();
       setMicVadStatus(null);
       if (pending) {
+        autoSentRef.current = true;
         setChatInput('');
         liveTranscriptRef.current = '';
         void handleSendChatRef.current(pending);
@@ -432,99 +451,122 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
       return;
     }
 
-    // Stop AI voice while user speaks into mic
+    // Stop AI voice cleanly before starting mic
     stop();
+    setErrorMsg(null);
 
     liveTranscriptRef.current = '';
     hasSpokenRef.current = false;
     autoSentRef.current = false;
+    manualStopRef.current = false;
+    recognitionErrorHandledRef.current = false;
     setChatInput('');
-    setMicVadStatus('هضر دابا... غير تسكت 1.5 ثانية غيتصيفط سؤالك أوتوماتيكياً');
+    setMicVadStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتصيفط سؤالك أوتوماتيكياً');
 
-    // Start Web Audio VAD stream (detects real voice activity & 1.5s silence)
-    if (navigator.mediaDevices?.getUserMedia) {
-      try {
-        const micStream = await navigator.mediaDevices.getUserMedia({audio: true});
-        vadStreamRef.current = micStream;
-        const AudioCtx =
-          window.AudioContext ||
-          (window as unknown as {webkitAudioContext: typeof AudioContext}).webkitAudioContext;
-        const audioCtx = new AudioCtx();
-        vadAudioCtxRef.current = audioCtx;
-        const source = audioCtx.createMediaStreamSource(micStream);
-        const analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 512;
-        source.connect(analyser);
-        const dataArray = new Uint8Array(analyser.fftSize);
+    const speechLangs = ['ar-MA', 'ar-SA', 'ar'];
 
-        const monitorVad = () => {
-          if (!vadAudioCtxRef.current || autoSentRef.current) return;
-          analyser.getByteTimeDomainData(dataArray);
-          let sumSq = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            const norm = (dataArray[i] - 128) / 128;
-            sumSq += norm * norm;
+    const startWithLang = (langIndex: number) => {
+      const rec = new SR();
+      rec.lang = speechLangs[langIndex];
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+
+      rec.onresult = (ev) => {
+        let combined = '';
+        for (let i = 0; i < ev.results.length; i++) {
+          const piece = ev.results[i]?.[0]?.transcript;
+          if (piece) {
+            combined += `${piece} `;
           }
-          const rms = Math.sqrt(sumSq / dataArray.length);
-          if (rms > 0.03) {
-            hasSpokenRef.current = true;
-            scheduleSilenceAutoSend();
-          }
-          vadRafRef.current = requestAnimationFrame(monitorVad);
-        };
-        vadRafRef.current = requestAnimationFrame(monitorVad);
-      } catch {
-        // SpeechRecognition timer fallback remains active even if AnalyserNode mic stream isn't duplicated
-      }
-    }
+        }
+        const clean = combined.replace(/\s+/g, ' ').trim();
+        if (clean) {
+          hasSpokenRef.current = true;
+          liveTranscriptRef.current = clean;
+          setChatInput(clean);
+          setMicVadStatus(`سمعتك: "${clean}" — غير تسكت 1.5ث غيتصيفط`);
+          scheduleSilenceAutoSend();
+        }
+      };
 
-    const rec = new SR() as {
-      lang: string;
-      continuous: boolean;
-      interimResults: boolean;
-      onresult: (ev: {results: ArrayLike<ArrayLike<{transcript: string}>>}) => void;
-      onspeechend?: () => void;
-      onerror: () => void;
-      onend: () => void;
-      start: () => void;
-      stop: () => void;
-    };
-    rec.lang = 'ar-MA';
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.onresult = (ev) => {
-      let combined = '';
-      for (let i = 0; i < ev.results.length; i++) {
-        combined += ev.results[i][0].transcript + ' ';
-      }
-      const clean = combined.trim();
-      if (clean) {
-        hasSpokenRef.current = true;
-        liveTranscriptRef.current = clean;
-        setChatInput(clean);
-        scheduleSilenceAutoSend();
-      }
-    };
-    rec.onspeechend = () => {
-      if (hasSpokenRef.current) {
-        scheduleSilenceAutoSend();
-      }
-    };
-    rec.onerror = () => {
-      cleanupMicVad();
-      setMicVadStatus(null);
-    };
-    rec.onend = () => {
-      if (!autoSentRef.current && hasSpokenRef.current && liveTranscriptRef.current.trim()) {
-        scheduleSilenceAutoSend();
-      } else if (!autoSentRef.current) {
+      rec.onspeechend = () => {
+        if (hasSpokenRef.current && liveTranscriptRef.current.trim()) {
+          scheduleSilenceAutoSend();
+        }
+      };
+
+      rec.onerror = (ev) => {
+        const errCode = ev?.error || '';
+        if (errCode === 'language-not-supported' && langIndex + 1 < speechLangs.length) {
+          rec.onresult = null;
+          rec.onspeechend = null;
+          rec.onerror = null;
+          rec.onend = null;
+          try {
+            rec.stop();
+          } catch {
+            // ignore
+          }
+          startWithLang(langIndex + 1);
+          return;
+        }
+
+        if (errCode === 'aborted' && (manualStopRef.current || autoSentRef.current)) {
+          return;
+        }
+
+        if (errCode === 'no-speech' && liveTranscriptRef.current.trim()) {
+          scheduleSilenceAutoSend();
+          return;
+        }
+
+        recognitionErrorHandledRef.current = true;
         cleanupMicVad();
         setMicVadStatus(null);
+
+        if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+          setErrorMsg('المتصفح منع الميكروفون. عطيه الإذن (Allow) من القفل لي حدا رابط الموقع الفوق.');
+        } else if (errCode === 'audio-capture') {
+          setErrorMsg('ما لقيناش ميكروفون شغال فهاد الجهاز.');
+        } else if (errCode === 'no-speech') {
+          setErrorMsg('ما سمعت حتى كلمة فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
+        } else if (errCode === 'network') {
+          setErrorMsg('الميكروفون التلقائي ف Chrome كيحتاج أنترنت مستقر، عاود جرب.');
+        } else {
+          setErrorMsg('وقع مشكل فالميكروفون، عاود ضغط على أيقونة الميكرو وهضر بالدارجة.');
+        }
+      };
+
+      rec.onend = () => {
+        if (autoSentRef.current || manualStopRef.current || recognitionErrorHandledRef.current) {
+          return;
+        }
+        const pending = liveTranscriptRef.current.trim();
+        if (pending) {
+          setIsListeningMic(false);
+          recognitionRef.current = null;
+          setMicVadStatus(`سمعتك: "${pending}" — غادي يتصيفط بعد 1.5ث...`);
+          scheduleSilenceAutoSend();
+        } else {
+          cleanupMicVad();
+          setMicVadStatus(null);
+          setErrorMsg('الميكروفون حبس قبل ما يسمع كلام واضح. عاود ضغط وهضر نيشان بالدارجة.');
+        }
+      };
+
+      recognitionRef.current = rec as unknown as typeof recognitionRef.current;
+      try {
+        rec.start();
+        setIsListeningMic(true);
+      } catch {
+        cleanupMicVad();
+        setMicVadStatus(null);
+        setErrorMsg('تعذر تشغيل الميكروفون، عاود ضغط على الزر وتأكد من إذن الميكرو.');
       }
     };
-    recognitionRef.current = rec;
-    rec.start();
-    setIsListeningMic(true);
+
+    startWithLang(0);
   };
 
   const handleSave = async () => {
@@ -565,8 +607,9 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
         </button>
 
         <div className="flex items-center gap-2">
-          <VoiceGenderSwitch />
+          <VoiceGenderSwitch useCloudTts />
           <SpeakButton
+            useCloudTts
             id="analyze-page-intro"
             variant="ghost"
             label="سمع الشرح"
@@ -638,7 +681,13 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
         <div className="rounded-2xl border border-red-500/40 bg-red-950/30 p-4 flex items-start gap-3 text-red-200">
           <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
           <div className="flex-1 text-sm leading-relaxed">{errorMsg}</div>
-          <SpeakButton id="analyze-err-voice" compact variant="ghost" text={errorMsg} />
+          <SpeakButton
+            useCloudTts
+            id="analyze-err-voice"
+            compact
+            variant="ghost"
+            text={errorMsg}
+          />
         </div>
       )}
 
@@ -719,6 +768,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
                     {!isUser && (
                       <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-white/10">
                         <SpeakButton
+                          useCloudTts
                           id={msg.id}
                           variant="primary"
                           compact={false}
@@ -891,6 +941,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
                       <h3 className="text-lg font-bold text-white">تفاصيل الغرف والمساحات</h3>
                     </div>
                     <SpeakButton
+                      useCloudTts
                       id="plan-rooms-all"
                       variant="secondary"
                       label="سمع الغرف"
@@ -915,6 +966,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
                           </p>
                         </div>
                         <SpeakButton
+                          useCloudTts
                           id={`room-${idx}`}
                           compact
                           variant="ghost"
@@ -935,6 +987,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
                       <h3 className="text-lg font-bold text-white">المواد المطلوبة التقديرية</h3>
                     </div>
                     <SpeakButton
+                      useCloudTts
                       id="plan-materials-all"
                       variant="secondary"
                       label="سمع المواد"
@@ -958,6 +1011,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
                           <p className="text-xs text-slate-300">{mat.notesDarija}</p>
                         </div>
                         <SpeakButton
+                          useCloudTts
                           id={`mat-${idx}`}
                           compact
                           variant="ghost"
@@ -978,6 +1032,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
                       <h3 className="text-lg font-bold text-white">مراحل العمل بالترتيب</h3>
                     </div>
                     <SpeakButton
+                      useCloudTts
                       id="plan-phases-all"
                       variant="secondary"
                       label="سمع المراحل بالترتيب"
@@ -1006,6 +1061,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
                           </p>
                         </div>
                         <SpeakButton
+                          useCloudTts
                           id={`phase-${idx}`}
                           compact
                           variant="ghost"

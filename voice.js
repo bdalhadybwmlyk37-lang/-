@@ -598,6 +598,8 @@ export async function callTTS(text, voiceId, options = {}) {
   const resolvedVoiceId = normalizeVoiceId(voiceId) || getVoiceId();
   const id = options.id || 'global';
   const isAdminKeyTest = typeof options.testOrder === 'number';
+  const shouldUseCloudTts =
+    Boolean(options.useCloudTts) || isAdminKeyTest || String(id).startsWith('admin-');
   const speechRate = typeof options.speechRate === 'number' ? options.speechRate : 0.95;
 
   const darijaText = toDarija(text);
@@ -607,6 +609,23 @@ export async function callTTS(text, voiceId, options = {}) {
 
   stopAudio();
   const myToken = requestToken;
+
+  if (!shouldUseCloudTts) {
+    const browserPlayed = await speakWithBrowserFallback(
+      darijaText,
+      resolvedVoiceId,
+      id,
+      myToken,
+      speechRate
+    );
+    return {
+      ok: browserPlayed,
+      usedFallback: false,
+      browserOnly: true,
+      voiceId: resolvedVoiceId,
+      voiceName: resolvedVoiceId,
+    };
+  }
 
   getAudioContext();
 

@@ -1,5 +1,18 @@
 import {GoogleGenAI, Type} from '@google/genai';
 
+type ApiRequest = {
+  method?: string;
+  body?: unknown;
+  on?: (event: string, listener: (chunk?: unknown) => void) => void;
+};
+
+type ApiResponse = {
+  setHeader: (name: string, value: string) => void;
+  status: (code: number) => ApiResponse;
+  json: (payload: Record<string, unknown>) => void;
+  end: (chunk?: string) => void;
+};
+
 const PLAN_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
@@ -22,21 +35,21 @@ const PLAN_RESPONSE_SCHEMA = {
     },
     roomsCount: {
       type: Type.INTEGER,
-      description: 'عدد الغرف والمرافق الموجودة فالبلان',
+      description: 'العدد الإجمالي للغرف والمرافق الرئيسية',
     },
     darijaSummary: {
       type: Type.STRING,
-      description: 'شرح شامل ومفصل ومفهوم ديال البلان كامل بالدارجة المغربية النقية',
+      description:
+        'شرح كامل بالدارجة المغربية 100% بلا حتى كلمة فرنسية. إلا ما كانتش صورة بلان، حط بالضبط: هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك',
     },
     rebarDetailsDarija: {
       type: Type.STRING,
       description:
-        'شرح مفصل ديال الحديد والتسليح بالدارجة: فين كاين الحديد (السواري، الضالة، الكمرة، السوميلة)، شحال من بار (قضيب)، الأقطار والمسافات بين الحديد',
+        'تفاصيل الحديد والتسليح بالدارجة المغربية: فين كاين الحديد (السواري، الكمرات، الضالة، السوميلات)، شحال من بار (قضيب)، قطر الحديد، والمسافات بيناتهم (مثلا كل 15 سنتيم).',
     },
     audioScript: {
       type: Type.STRING,
-      description:
-        'نص نقي ومنظم ومباشر 100% بالدارجة المغربية النقية باش يتقرا بالصوت بلا رموز ولا فرنسية',
+      description: 'نص نقي للقراءة الصوتية بالدارجة المغربية 100% بدون أي كلمة فرنسية أو رموز غريبة.',
     },
     rooms: {
       type: Type.ARRAY,
@@ -44,11 +57,10 @@ const PLAN_RESPONSE_SCHEMA = {
         type: Type.OBJECT,
         properties: {
           name: {type: Type.STRING},
-          dimensions: {type: Type.STRING},
           areaSqm: {type: Type.STRING},
-          purposeDarija: {type: Type.STRING},
+          notesDarija: {type: Type.STRING},
         },
-        required: ['name', 'dimensions', 'areaSqm', 'purposeDarija'],
+        required: ['name', 'areaSqm', 'notesDarija'],
       },
     },
     materials: {
@@ -57,14 +69,27 @@ const PLAN_RESPONSE_SCHEMA = {
         type: Type.OBJECT,
         properties: {
           item: {type: Type.STRING},
-          quantity: {type: Type.STRING},
+          quantityEstimate: {type: Type.STRING},
           unit: {type: Type.STRING},
           notesDarija: {type: Type.STRING},
         },
-        required: ['item', 'quantity', 'unit', 'notesDarija'],
+        required: ['item', 'quantityEstimate', 'unit', 'notesDarija'],
       },
     },
     workPhases: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          stepNumber: {type: Type.INTEGER},
+          phaseName: {type: Type.STRING},
+          durationEstimate: {type: Type.STRING},
+          explanationDarija: {type: Type.STRING},
+        },
+        required: ['stepNumber', 'phaseName', 'durationEstimate', 'explanationDarija'],
+      },
+    },
+    warningsDarija: {
       type: Type.ARRAY,
       items: {type: Type.STRING},
     },
@@ -81,17 +106,16 @@ const PLAN_RESPONSE_SCHEMA = {
     'rooms',
     'materials',
     'workPhases',
+    'warningsDarija',
   ],
 };
 
-function jsonResponse(payload: Record<string, unknown>, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
-    },
-  });
+function setCorsHeaders(res: ApiResponse): void {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
 }
 
 function resolveApiKey(): string | null {
@@ -100,8 +124,8 @@ function resolveApiKey(): string | null {
     process.env.GOOGLE_API_KEY,
     process.env.AI_API_KEY,
   ];
-  for (const val of candidates) {
-    const trimmed = typeof val === 'string' ? val.trim() : '';
+  for (const candidate of candidates) {
+    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
     if (trimmed && trimmed !== 'MY_GEMINI_API_KEY') {
       return trimmed;
     }
@@ -117,38 +141,120 @@ function cleanJsonString(raw: string): string {
     .trim();
 }
 
-export async function POST(request: Request): Promise<Response> {
+async function parseRequestBody(
+  req: ApiRequest
+): Promise<{imageBase64?: string; mimeType?: string; notes?: string} | null> {
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === 'string') {
+      try {
+        return JSON.parse(req.body) as {imageBase64?: string; mimeType?: string; notes?: string};
+      } catch {
+        return null;
+      }
+    }
+    if (Buffer.isBuffer(req.body)) {
+      try {
+        return JSON.parse(req.body.toString('utf8')) as {
+          imageBase64?: string;
+          mimeType?: string;
+          notes?: string;
+        };
+      } catch {
+        return null;
+      }
+    }
+    if (typeof req.body === 'object') {
+      return req.body as {imageBase64?: string; mimeType?: string; notes?: string};
+    }
+  }
+
+  if (typeof req.on !== 'function') {
+    return null;
+  }
+
+  const rawText = await new Promise<string>((resolve) => {
+    const chunks: Buffer[] = [];
+    req.on?.('data', (chunk?: unknown) => {
+      if (Buffer.isBuffer(chunk)) {
+        chunks.push(chunk);
+      } else if (typeof chunk === 'string') {
+        chunks.push(Buffer.from(chunk, 'utf8'));
+      }
+    });
+    req.on?.('end', () => {
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on?.('error', () => {
+      resolve('');
+    });
+  });
+
+  if (!rawText) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(rawText) as {imageBase64?: string; mimeType?: string; notes?: string};
+  } catch {
+    return null;
+  }
+}
+
+export default async function handler(req: ApiRequest, res: ApiResponse): Promise<void> {
+  setCorsHeaders(res);
+
+  if (req.method === 'OPTIONS') {
+    res.status(200).json({ok: true});
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.status(405).json({
+      success: false,
+      error: 'الطريقة غير مسموح بها، استعمل POST.',
+    });
+    return;
+  }
+
   try {
     const apiKey = resolveApiKey();
     if (!apiKey) {
-      return jsonResponse(
-        {
-          success: false,
-          error: 'مفتاح الذكاء الاصطناعي غير مضبوط في إعدادات الخادم (GEMINI_API_KEY).',
-        },
-        503
-      );
+      res.status(503).json({
+        success: false,
+        error: 'مفتاح الذكاء الاصطناعي غير مضبوط في إعدادات الخادم (GEMINI_API_KEY).',
+      });
+      return;
     }
 
-    let body: {imageBase64?: string; mimeType?: string; notes?: string};
-    try {
-      body = (await request.json()) as {imageBase64?: string; mimeType?: string; notes?: string};
-    } catch {
-      return jsonResponse({success: false, error: 'تعذر قراءة بيانات الصورة المرسلة.'}, 400);
+    const body = await parseRequestBody(req);
+    if (!body) {
+      res.status(400).json({
+        success: false,
+        error: 'تعذر قراءة بيانات الصورة المرسلة.',
+      });
+      return;
     }
 
-    const {imageBase64, mimeType, notes} = body || {};
+    const {imageBase64, mimeType, notes} = body;
     if (!imageBase64 || typeof imageBase64 !== 'string') {
-      return jsonResponse({success: false, error: 'خاصك تصور ولا ترفع صورة ديال البلان أولا.'}, 400);
+      res.status(400).json({
+        success: false,
+        error: 'خاصك تصور ولا ترفع صورة ديال البلان أولا.',
+      });
+      return;
     }
 
     const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
     if (!cleanBase64) {
-      return jsonResponse({success: false, error: 'صورة البلان غير صالحة، عاود رفع الصورة.'}, 400);
+      res.status(400).json({
+        success: false,
+        error: 'صورة البلان غير صالحة، عاود رفع الصورة.',
+      });
+      return;
     }
 
     const safeMime = mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg';
-    const trimmedNotes = (notes || '').trim();
+    const trimmedNotes = typeof notes === 'string' ? notes.trim() : '';
     const promptText = [
       'حلل هاد الصورة مزيان: أول حاجة تأكد واش هادي صورة ديال بلان بناء أو بلان ديال الحديد (مخطط هندسي، رسومات معمارية، أو تسليح).',
       'إلى ما كانتش صورة بلان ديال البناء ولا الحديد، رجع isBlueprint: false وحط بالضبط فـ darijaSummary وفـ audioScript: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".',
@@ -158,45 +264,48 @@ export async function POST(request: Request): Promise<Response> {
       .filter(Boolean)
       .join('\n\n');
 
-    const ai = new GoogleGenAI({apiKey});
-    const models = ['gemini-3.8-flash', 
-    let lastError: unknown = null;
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
 
-    for (const model of models) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: {
-            parts: [{inlineData: {mimeType: safeMime, data: cleanBase64}}, {text: promptText}],
-          },
-          config: {
-            systemInstruction:
-              'أنت معلم بناء ومهندس مغربي كتجاوب 100% بالدارجة المغربية الصافية والمفهومة، وممنوع نهائياً تكتب أي كلمة بالفرنسية أو الإنجليزية أو الترجمة الحرفية بحال béton أو dalle أو ferraillage أو diamètre أو salon أو cuisine أو R+1 — استعمل غير الكلمات المغربية العربية (الضالة، السواري، الكمرة، السوميلة، الحديد، البار، القطر، السنتيم، الصالون، الكوزينة، البيت، السيما، الرملة، الكياس). إلا كانت الصورة ماشي بلان ديال البناء أو الحديد (مثلاً وجه إنسان، طريق، طابلة، حيط خاوي...)، ضروري ترد isBlueprint=false وتكتب بالضبط: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".',
-            responseMimeType: 'application/json',
-            responseSchema: PLAN_RESPONSE_SCHEMA,
-          },
-        });
-        const text = response.text;
-        if (!text) {
-          throw new Error('رد فارغ من الذكاء الاصطناعي');
-        }
-        const parsed = JSON.parse(cleanJsonString(text)) as Record<string, unknown>;
-        if (parsed.isBlueprint === false) {
-          const rejection = 'هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك';
-          parsed.darijaSummary = rejection;
-          parsed.audioScript = rejection;
-          parsed.rebarDetailsDarija = rejection;
-        }
-        return jsonResponse({success: true, ...parsed}, 200);
-      } catch (err) {
-        lastError = err;
-      }
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: {
+        parts: [{inlineData: {mimeType: safeMime, data: cleanBase64}}, {text: promptText}],
+      },
+      config: {
+        systemInstruction:
+          'أنت معلم بناء ومهندس مغربي كتجاوب 100% بالدارجة المغربية الصافية والمفهومة، وممنوع نهائياً تكتب أي كلمة بالفرنسية أو الإنجليزية أو الترجمة الحرفية بحال béton أو dalle أو ferraillage أو diamètre أو salon أو cuisine أو R+1 — استعمل غير الكلمات المغربية العربية (الضالة، السواري، الكمرة، السوميلة، الحديد، البار، القطر، السنتيم، الصالون، الكوزينة، البيت، السيما، الرملة، الكياس). إلا كانت الصورة ماشي بلان ديال البناء أو الحديد (مثلاً وجه إنسان، طريق، طابلة، حيط خاوي...)، ضروري ترد isBlueprint=false وتكتب بالضبط: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".',
+        responseMimeType: 'application/json',
+        responseSchema: PLAN_RESPONSE_SCHEMA,
+      },
+    });
+
+    const text = response.text;
+    if (!text) {
+      res.status(502).json({
+        success: false,
+        error: 'رد فارغ من الذكاء الاصطناعي، عاود حاول.',
+      });
+      return;
     }
 
-    const msg = lastError instanceof Error ? lastError.message : 'تعذر تحليل البلان، عاود حاول';
-    return jsonResponse({success: false, error: msg}, 500);
+    const parsed = JSON.parse(cleanJsonString(text)) as Record<string, unknown>;
+    if (parsed.isBlueprint === false) {
+      const rejection = 'هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك';
+      parsed.darijaSummary = rejection;
+      parsed.audioScript = rejection;
+      parsed.rebarDetailsDarija = rejection;
+    }
+
+    res.status(200).json({success: true, ...parsed});
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'تعذر تحليل البلان، عاود حاول';
-    return jsonResponse({success: false, error: msg}, 500);
+    res.status(500).json({success: false, error: msg});
   }
 }

@@ -244,7 +244,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
       return;
     }
 
-    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,/, '');
+    const cleanBase64 = imageBase64.replace(/^data:[^;]+;base64,[STRIPPED], '');
     if (!cleanBase64) {
       res.status(400).json({
         success: false,
@@ -273,28 +273,50 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
       },
     });
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: {
-        parts: [{inlineData: {mimeType: safeMime, data: cleanBase64}}, {text: promptText}],
-      },
-      config: {
-        systemInstruction:
-          'أنت معلم بناء ومهندس مغربي كتجاوب 100% بالدارجة المغربية الصافية والمفهومة، وممنوع نهائياً تكتب أي كلمة بالفرنسية أو الإنجليزية أو الترجمة الحرفية بحال béton أو dalle أو ferraillage أو diamètre أو salon أو cuisine أو R+1 — استعمل غير الكلمات المغربية العربية (الضالة، السواري، الكمرة، السوميلة، الحديد، البار، القطر، السنتيم، الصالون، الكوزينة، البيت، السيما، الرملة، الكياس). إلا كانت الصورة ماشي بلان ديال البناء أو الحديد (مثلاً وجه إنسان، طريق، طابلة، حيط خاوي...)، ضروري ترد isBlueprint=false وتكتب بالضبط: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".',
-        responseMimeType: 'application/json',
-        responseSchema: PLAN_RESPONSE_SCHEMA,
-      },
-    });
+    const systemInstructionText =
+      'أنت معلم بناء ومهندس مغربي كتجاوب 100% بالدارجة المغربية الصافية والمفهومة، وممنوع نهائياً تكتب أي كلمة بالفرنسية أو الإنجليزية أو الترجمة الحرفية بحال béton أو dalle أو ferraillage أو diamètre أو salon أو cuisine أو R+1 — استعمل غير الكلمات المغربية العربية (الضالة، السواري، الكمرة، السوميلة، الحديد، البار، القطر، السنتيم، الصالون، الكوزينة، البيت، السيما، الرملة، الكياس). إلا كانت الصورة ماشي بلان ديال البناء أو الحديد (مثلاً وجه إنسان، طريق، طابلة، حيط خاوي...)، ضروري ترد isBlueprint=false وتكتب بالضبط: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".';
 
-    const text = response.text;
-    if (!text) {
-      res.status(502).json({
-        success: false,
-        error: 'رد فارغ من الذكاء الاصطناعي، عاود حاول.',
-      });
-      return;
-    }
+    const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
 
+    const runAttempt = async (modelIndex: number): Promise<string> => {
+      const modelName = modelsToTry[modelIndex];
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: {
+            parts: [{inlineData: {mimeType: safeMime, data: cleanBase64}}, {text: promptText}],
+          },
+          config: {
+            systemInstruction: systemInstructionText,
+            responseMimeType: 'application/json',
+            responseSchema: PLAN_RESPONSE_SCHEMA,
+          },
+        });
+        const text = response.text;
+        if (!text) {
+          throw new Error('رد فارغ من الذكاء الاصطناعي، عاود حاول.');
+        }
+        return text;
+      } catch (attemptErr) {
+        const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
+        const lowerMsg = errMsg.toLowerCase();
+        const isSwitchable =
+          lowerMsg.includes('503') ||
+          lowerMsg.includes('unavailable') ||
+          lowerMsg.includes('overloaded') ||
+          lowerMsg.includes('high demand') ||
+          lowerMsg.includes('429') ||
+          lowerMsg.includes('resource_exhausted') ||
+          lowerMsg.includes('404') ||
+          lowerMsg.includes('not_found');
+        if (isSwitchable && modelIndex + 1 < modelsToTry.length) {
+          return runAttempt(modelIndex + 1);
+        }
+        throw attemptErr;
+      }
+    };
+
+    const text = await runAttempt(0);
     const parsed = JSON.parse(cleanJsonString(text)) as Record<string, unknown>;
     if (parsed.isBlueprint === false) {
       const rejection = 'هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك';
@@ -305,7 +327,16 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
 
     res.status(200).json({success: true, ...parsed});
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'تعذر تحليل البلان، عاود حاول';
-    res.status(500).json({success: false, error: msg});
+    const rawMsg = err instanceof Error ? err.message : 'تعذر تحليل البلان، عاود حاول';
+    const isOverloaded =
+      rawMsg.includes('503') ||
+      rawMsg.toLowerCase().includes('overloaded') ||
+      rawMsg.toLowerCase().includes('high demand');
+    res.status(isOverloaded ? 503 : 500).json({
+      success: false,
+      error: isOverloaded
+        ? 'السيرفرات ديال الذكاء الاصطناعي عامرين دابا شوية، عاود ضغط على التحليل من بعد ثواني قليلة.'
+        : rawMsg,
+    });
   }
 }

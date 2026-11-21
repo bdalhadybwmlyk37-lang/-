@@ -752,6 +752,132 @@ async function startServer() {
     }
   });
 
+  app.post('/api/transcribe', async (req, res) => {
+    const apiKey = resolveServerAiApiKey();
+    if (!apiKey) {
+      res.status(503).json({
+        success: false,
+        error: 'مفتاح الذكاء الاصطناعي غير مضبوط على الخادم (GEMINI_API_KEY).',
+      });
+      return;
+    }
+
+    const {audioBase64, mimeType} = (req.body && typeof req.body === 'object' ? req.body : {}) as {
+      audioBase64?: string;
+      mimeType?: string;
+    };
+
+    if (!audioBase64 || typeof audioBase64 !== 'string') {
+      res.status(400).json({success: false, error: 'ما وصلنيش الصوت من الميكروفون، عاود جرب.'});
+      return;
+    }
+
+    const cleanBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '').trim();
+    if (!cleanBase64) {
+      res.status(400).json({success: false, error: 'التسجيل الصوتي خاوي، عاود هضر فالميكرو.'});
+      return;
+    }
+
+    const baseMime =
+      typeof mimeType === 'string' && mimeType.trim().startsWith('audio/')
+        ? mimeType.split(';')[0].trim()
+        : 'audio/webm';
+
+    const promptText = [
+      'سمع هاد التسجيل الصوتي مزيان واكتب بالحرف شنو قال المتكلم بالدارجة المغربية (أو العربية/مصطلحات البناء بحال الحديد، السواري، الضالة، البار، السوميلة، السيما، الرملة، السنتيم).',
+      'القواعد:',
+      '1. رجع غير النص المنطوق بوحدو بحروف عربية واضحة وبلا علامات تنصيص وبلا أي شرح أو جواب على السؤال.',
+      '2. إلى كان التسجيل فيه غير صمت أو ضجيج بلا كلام بشري مفهوم، رجع بالضبط: __EMPTY__',
+    ].join('\n');
+
+    const modelsToTry = [
+      'gemini-3.5-transcribe',
+      'gemini-3.8-flash',
+      'gemini-4-hydrogen',
+      'gemini-3.1-flash-lite',
+    ];
+
+    const runAttempt = async (modelIndex: number, useVertexAi: boolean): Promise<string> => {
+      const modelName = modelsToTry[modelIndex];
+      const client = new GoogleGenAI({
+        apiKey,
+        ...(useVertexAi ? {vertexai: true} : {}),
+        httpOptions: {headers: {'User-Agent': 'aistudio-build'}},
+      });
+
+      try {
+        const response = await enqueueGoogleRequest(() =>
+          client.models.generateContent({
+            model: modelName,
+            contents: {
+              parts: [
+                {inlineData: {mimeType: baseMime, data: cleanBase64}},
+                {text: promptText},
+              ],
+            },
+          })
+        );
+        return response.text || '';
+      } catch (attemptErr) {
+        const msg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
+        const lower = msg.toLowerCase();
+        const isAuthScopeError =
+          lower.includes('401') ||
+          lower.includes('403') ||
+          lower.includes('api_key_invalid') ||
+          lower.includes('api key not valid') ||
+          lower.includes('unauthenticated') ||
+          lower.includes('access_token_type_unsupported');
+
+        if (!useVertexAi && isAuthScopeError && apiKey.startsWith('AQ.')) {
+          return runAttempt(modelIndex, true);
+        }
+
+        const isSwitchable =
+          lower.includes('503') ||
+          lower.includes('unavailable') ||
+          lower.includes('overloaded') ||
+          lower.includes('high demand') ||
+          lower.includes('429') ||
+          lower.includes('resource_exhausted') ||
+          lower.includes('404') ||
+          lower.includes('not_found') ||
+          lower.includes('400');
+
+        if (isSwitchable && modelIndex + 1 < modelsToTry.length) {
+          return runAttempt(modelIndex + 1, useVertexAi);
+        }
+        throw attemptErr;
+      }
+    };
+
+    try {
+      const raw = await runAttempt(0, false);
+      const cleaned = raw
+        .replace(/^```[\w-]*\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .replace(/^["'«»“”]+|["'«»“”]+$/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const finalText =
+        !cleaned ||
+        cleaned === '__EMPTY__' ||
+        /^\[(صمت|لا يوجد كلام|silence|no speech|inaudible)\]$/i.test(cleaned) ||
+        /^(صمت|لا يوجد صوت|لا يوجد كلام)$/i.test(cleaned)
+          ? ''
+          : cleaned;
+
+      res.status(200).json({success: true, text: finalText});
+    } catch (err) {
+      console.error('Gemini transcribe error:', err);
+      res.status(500).json({
+        success: false,
+        error: 'تعذر تحويل الصوت لكتابة دابا، عاود جرب أو كتب سؤالك بيديك.',
+      });
+    }
+  });
+
   function toDarijaServer(input: string): string {
     return input
       .replace(/مرحبا بكم?/g, 'مرحبا بيك')

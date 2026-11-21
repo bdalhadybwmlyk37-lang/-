@@ -130,7 +130,9 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
   const [chatInput, setChatInput] = useState('');
   const [isChatSending, setIsChatSending] = useState(false);
   const [isListeningMic, setIsListeningMic] = useState(false);
+  const [isTranscribingMic, setIsTranscribingMic] = useState(false);
   const [micVadStatus, setMicVadStatus] = useState<string | null>(null);
+  const [micErrorMsg, setMicErrorMsg] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<{
@@ -141,6 +143,13 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     stop: () => void;
     abort?: () => void;
   } | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const vadIntervalRef = useRef<number | null>(null);
+  const autoSendDelayTimerRef = useRef<number | null>(null);
+  const discardRecordingRef = useRef<boolean>(false);
   const silenceTimerRef = useRef<number | null>(null);
   const liveTranscriptRef = useRef<string>('');
   const hasSpokenRef = useRef<boolean>(false);
@@ -357,11 +366,58 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
   });
 
   const SILENCE_AUTO_SEND_MS = 1500;
+  const NO_SPEECH_TIMEOUT_MS = 9500;
+  const MAX_RECORDING_MS = 35000;
 
-  const cleanupMicVad = () => {
+  const stopVadAndStreamOnly = () => {
+    if (vadIntervalRef.current !== null) {
+      window.clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+    if (audioContextRef.current) {
+      const ctx = audioContextRef.current;
+      audioContextRef.current = null;
+      ctx.close().catch(() => undefined);
+    }
+    if (mediaStreamRef.current) {
+      const stream = mediaStreamRef.current;
+      mediaStreamRef.current = null;
+      stream.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // ignore
+        }
+      });
+    }
+  };
+
+  const cleanupMicVad = (discardRecorder = false) => {
     if (silenceTimerRef.current !== null) {
       window.clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
+    }
+    if (autoSendDelayTimerRef.current !== null) {
+      window.clearTimeout(autoSendDelayTimerRef.current);
+      autoSendDelayTimerRef.current = null;
+    }
+    stopVadAndStreamOnly();
+    if (mediaRecorderRef.current) {
+      const rec = mediaRecorderRef.current;
+      mediaRecorderRef.current = null;
+      if (discardRecorder) {
+        discardRecordingRef.current = true;
+        rec.ondataavailable = null;
+        rec.onstop = null;
+        rec.onerror = null;
+      }
+      if (rec.state !== 'inactive') {
+        try {
+          rec.stop();
+        } catch {
+          // ignore
+        }
+      }
     }
     if (recognitionRef.current) {
       const activeRec = recognitionRef.current;
@@ -382,21 +438,102 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
   useEffect(() => {
     return () => {
       manualStopRef.current = true;
-      cleanupMicVad();
+      cleanupMicVad(true);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const blobToDataUrl = (blob: Blob): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result === 'string') {
+          resolve(reader.result);
+        } else {
+          reject(new Error('تعذر قراءة التسجيل الصوتي'));
+        }
+      };
+      reader.onerror = () => reject(new Error('تعذر قراءة التسجيل الصوتي'));
+      reader.readAsDataURL(blob);
+    });
+
+  const deliverTranscribedText = (spokenText: string) => {
+    const cleanText = spokenText.replace(/\s+/g, ' ').trim();
+    if (!cleanText) {
+      setMicVadStatus(null);
+      setMicErrorMsg('ما سمعت حتى كلمة واضحة، قرب شوية للميكرو وعاود هضر بالدارجة.');
+      return;
+    }
+
+    setMicErrorMsg(null);
+    setChatInput(cleanText);
+    setMicVadStatus(`سمعتك: "${cleanText}" — كيتصيفط دابا...`);
+
+    if (autoSendDelayTimerRef.current !== null) {
+      window.clearTimeout(autoSendDelayTimerRef.current);
+    }
+    autoSendDelayTimerRef.current = window.setTimeout(() => {
+      autoSendDelayTimerRef.current = null;
+      setMicVadStatus(null);
+      setChatInput('');
+      void handleSendChatRef.current(cleanText);
+    }, 450);
+  };
+
+  const transcribeRecordedBlob = async (blob: Blob, mimeType: string) => {
+    if (blob.size < 400) {
+      setMicVadStatus(null);
+      setMicErrorMsg('التسجيل قصير بزاف، عاود ضغط على الميكرو وهضر بالدارجة.');
+      return;
+    }
+
+    setIsTranscribingMic(true);
+    setMicErrorMsg(null);
+    setMicVadStatus('سمعتك، دابا كنكتب كلامك بالدارجة...');
+
+    try {
+      const audioBase64 = await blobToDataUrl(blob);
+      const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          audioBase64,
+          mimeType: (mimeType || blob.type || 'audio/webm').split(';')[0],
+        }),
+      });
+
+      const rawText = await res.text();
+      const data = parseApiJsonSafe<{success?: boolean; text?: string; error?: string}>(
+        rawText,
+        'تعذر تحويل الصوت لكتابة، عاود حاول.'
+      );
+
+      if (!res.ok || data.success === false) {
+        throw new Error(data.error || 'تعذر تحويل الصوت لكتابة، عاود حاول.');
+      }
+
+      const transcribed = typeof data.text === 'string' ? data.text.trim() : '';
+      setIsTranscribingMic(false);
+      deliverTranscribedText(transcribed);
+    } catch (err) {
+      setIsTranscribingMic(false);
+      setMicVadStatus(null);
+      setMicErrorMsg(
+        err instanceof Error && err.message
+          ? err.message
+          : 'تعذر تحويل الصوت لكتابة، عاود جرب أو كتب سؤالك بيديك.'
+      );
+    }
+  };
 
   const triggerAutoSendAfterSilence = () => {
     if (autoSentRef.current) return;
     const finalText = liveTranscriptRef.current.trim();
     autoSentRef.current = true;
-    cleanupMicVad();
+    cleanupMicVad(true);
     if (finalText) {
-      setMicVadStatus(`سمعتك وسكتي 1.5ث — كيتصيفط: "${finalText}"`);
-      setChatInput('');
       liveTranscriptRef.current = '';
-      void handleSendChatRef.current(finalText);
-      window.setTimeout(() => setMicVadStatus(null), 1800);
+      deliverTranscribedText(finalText);
     } else {
       setMicVadStatus(null);
     }
@@ -412,7 +549,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     }, SILENCE_AUTO_SEND_MS);
   };
 
-  const toggleVoiceQuestion = () => {
+  const startSpeechRecognitionFallback = () => {
     type SpeechRecInstance = {
       lang: string;
       continuous: boolean;
@@ -433,27 +570,9 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
         .webkitSpeechRecognition;
 
     if (!SR) {
-      setErrorMsg('المتصفح ما كيدعمش الميكروفون التلقائي، كتب سؤالك هنا.');
+      setMicErrorMsg('المتصفح ما كيدعمش الميكروفون التلقائي، كتب سؤالك هنا.');
       return;
     }
-
-    if (isListeningMic) {
-      manualStopRef.current = true;
-      const pending = liveTranscriptRef.current.trim();
-      cleanupMicVad();
-      setMicVadStatus(null);
-      if (pending) {
-        autoSentRef.current = true;
-        setChatInput('');
-        liveTranscriptRef.current = '';
-        void handleSendChatRef.current(pending);
-      }
-      return;
-    }
-
-    // Stop AI voice cleanly before starting mic
-    stop();
-    setErrorMsg(null);
 
     liveTranscriptRef.current = '';
     hasSpokenRef.current = false;
@@ -461,7 +580,7 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
     manualStopRef.current = false;
     recognitionErrorHandledRef.current = false;
     setChatInput('');
-    setMicVadStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتصيفط سؤالك أوتوماتيكياً');
+    setMicVadStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
 
     const speechLangs = ['ar-MA', 'ar-SA', 'ar'];
 
@@ -522,19 +641,17 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
         }
 
         recognitionErrorHandledRef.current = true;
-        cleanupMicVad();
+        cleanupMicVad(true);
         setMicVadStatus(null);
 
         if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
-          setErrorMsg('المتصفح منع الميكروفون. عطيه الإذن (Allow) من القفل لي حدا رابط الموقع الفوق.');
+          setMicErrorMsg('المتصفح منع الميكروفون. عطيه الإذن (Allow) من القفل لي حدا رابط الموقع الفوق.');
         } else if (errCode === 'audio-capture') {
-          setErrorMsg('ما لقيناش ميكروفون شغال فهاد الجهاز.');
+          setMicErrorMsg('ما لقيناش ميكروفون شغال فهاد الجهاز.');
         } else if (errCode === 'no-speech') {
-          setErrorMsg('ما سمعت حتى كلمة فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
-        } else if (errCode === 'network') {
-          setErrorMsg('الميكروفون التلقائي ف Chrome كيحتاج أنترنت مستقر، عاود جرب.');
+          setMicErrorMsg('ما سمعت حتى كلمة فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
         } else {
-          setErrorMsg('وقع مشكل فالميكروفون، عاود ضغط على أيقونة الميكرو وهضر بالدارجة.');
+          setMicErrorMsg('وقع مشكل فالميكروفون، عاود ضغط على أيقونة الميكرو وهضر بالدارجة.');
         }
       };
 
@@ -549,9 +666,9 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
           setMicVadStatus(`سمعتك: "${pending}" — غادي يتصيفط بعد 1.5ث...`);
           scheduleSilenceAutoSend();
         } else {
-          cleanupMicVad();
+          cleanupMicVad(true);
           setMicVadStatus(null);
-          setErrorMsg('الميكروفون حبس قبل ما يسمع كلام واضح. عاود ضغط وهضر نيشان بالدارجة.');
+          setMicErrorMsg('الميكروفون حبس قبل ما يسمع كلام واضح. عاود ضغط وهضر نيشان بالدارجة.');
         }
       };
 
@@ -560,13 +677,270 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
         rec.start();
         setIsListeningMic(true);
       } catch {
-        cleanupMicVad();
+        cleanupMicVad(true);
         setMicVadStatus(null);
-        setErrorMsg('تعذر تشغيل الميكروفون، عاود ضغط على الزر وتأكد من إذن الميكرو.');
+        setMicErrorMsg('تعذر تشغيل الميكروفون، عاود ضغط على الزر وتأكد من إذن الميكرو.');
       }
     };
 
     startWithLang(0);
+  };
+
+  const toggleVoiceQuestion = async () => {
+    if (isTranscribingMic) return;
+
+    if (isListeningMic) {
+      manualStopRef.current = true;
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        stopVadAndStreamOnly();
+        setIsListeningMic(false);
+        setMicVadStatus('كنجمع الصوت ونكتبو...');
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          cleanupMicVad(true);
+          setMicVadStatus(null);
+        }
+        return;
+      }
+
+      const pending = liveTranscriptRef.current.trim();
+      cleanupMicVad(true);
+      setMicVadStatus(null);
+      if (pending) {
+        autoSentRef.current = true;
+        liveTranscriptRef.current = '';
+        deliverTranscribedText(pending);
+      }
+      return;
+    }
+
+    // Stop AI voice cleanly before starting mic
+    stop();
+    setErrorMsg(null);
+    setMicErrorMsg(null);
+
+    const canRecordMedia =
+      typeof navigator !== 'undefined' &&
+      Boolean(navigator.mediaDevices?.getUserMedia) &&
+      typeof MediaRecorder !== 'undefined';
+
+    if (!canRecordMedia) {
+      startSpeechRecognitionFallback();
+      return;
+    }
+
+    liveTranscriptRef.current = '';
+    hasSpokenRef.current = false;
+    autoSentRef.current = false;
+    manualStopRef.current = false;
+    discardRecordingRef.current = false;
+    audioChunksRef.current = [];
+    setChatInput('');
+    setMicVadStatus('كنفتح الميكروفون...');
+
+    let stream: MediaStream;
+    try {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch (constraintErr) {
+        if (
+          constraintErr instanceof DOMException &&
+          (constraintErr.name === 'OverconstrainedError' ||
+            constraintErr.name === 'ConstraintNotSatisfiedError')
+        ) {
+          stream = await navigator.mediaDevices.getUserMedia({audio: true});
+        } else {
+          throw constraintErr;
+        }
+      }
+    } catch (err) {
+      setMicVadStatus(null);
+      const errName = err instanceof DOMException ? err.name : '';
+      if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
+        setMicErrorMsg('المتصفح منع الميكروفون. عطيه الإذن (Allow) من القفل لي حدا رابط الموقع الفوق.');
+      } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
+        setMicErrorMsg('ما لقيناش ميكروفون شغال فهاد الجهاز.');
+      } else {
+        setMicErrorMsg('تعذر تشغيل الميكروفون، تأكد من الإذن وعاود ضغط على الزر.');
+      }
+      return;
+    }
+
+    mediaStreamRef.current = stream;
+
+    const preferredMimes = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/mp4',
+      'audio/ogg;codecs=opus',
+      'audio/ogg',
+    ];
+    const supportedMime =
+      typeof MediaRecorder.isTypeSupported === 'function'
+        ? preferredMimes.find((m) => MediaRecorder.isTypeSupported(m)) || ''
+        : '';
+
+    let recorder: MediaRecorder;
+    try {
+      const options: MediaRecorderOptions = {audioBitsPerSecond: 32000};
+      if (supportedMime) {
+        options.mimeType = supportedMime;
+      }
+      recorder = new MediaRecorder(stream, options);
+    } catch {
+      try {
+        recorder = supportedMime
+          ? new MediaRecorder(stream, {mimeType: supportedMime})
+          : new MediaRecorder(stream);
+      } catch {
+        stopVadAndStreamOnly();
+        startSpeechRecognitionFallback();
+        return;
+      }
+    }
+
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        audioChunksRef.current.push(ev.data);
+      }
+    };
+
+    recorder.onerror = () => {
+      if (discardRecordingRef.current) return;
+      cleanupMicVad(true);
+      setMicVadStatus(null);
+      setMicErrorMsg('وقع مشكل فالتسجيل، عاود ضغط على الميكرو وهضر بالدارجة.');
+    };
+
+    recorder.onstop = () => {
+      const shouldDiscard = discardRecordingRef.current;
+      const chunks = audioChunksRef.current;
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = null;
+      stopVadAndStreamOnly();
+      setIsListeningMic(false);
+
+      if (shouldDiscard) {
+        return;
+      }
+
+      if (!hasSpokenRef.current && !manualStopRef.current) {
+        setMicVadStatus(null);
+        setMicErrorMsg('ما سمعت حتى صوت فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
+        return;
+      }
+
+      const finalMime = recorder.mimeType || supportedMime || 'audio/webm';
+      const audioBlob = new Blob(chunks, {type: finalMime});
+      void transcribeRecordedBlob(audioBlob, finalMime);
+    };
+
+    try {
+      recorder.start(250);
+    } catch {
+      cleanupMicVad(true);
+      setMicVadStatus(null);
+      setMicErrorMsg('تعذر بدء تسجيل الصوت، عاود جرب.');
+      return;
+    }
+
+    setIsListeningMic(true);
+    setMicVadStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
+
+    // Web Audio RMS Voice Activity Detector (1.5s silence auto-send)
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as {webkitAudioContext?: typeof AudioContext}).webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        audioContextRef.current = ctx;
+        if (ctx.state === 'suspended') {
+          void ctx.resume().catch(() => undefined);
+        }
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+
+        const timeData = new Uint8Array(analyser.fftSize);
+        const startedAt = Date.now();
+        let lastSpeechAt = startedAt;
+        let consecutiveSpeechFrames = 0;
+        let noiseFloor = 0.008;
+
+        vadIntervalRef.current = window.setInterval(() => {
+          const activeRec = mediaRecorderRef.current;
+          if (!activeRec || activeRec.state === 'inactive') {
+            return;
+          }
+
+          analyser.getByteTimeDomainData(timeData);
+          let sumSq = 0;
+          for (let i = 0; i < timeData.length; i++) {
+            const norm = (timeData[i] - 128) / 128;
+            sumSq += norm * norm;
+          }
+          const rms = Math.sqrt(sumSq / timeData.length);
+          const now = Date.now();
+
+          if (!hasSpokenRef.current && rms < 0.035) {
+            noiseFloor = noiseFloor * 0.85 + rms * 0.15;
+          }
+
+          const startThreshold = Math.max(0.015, Math.min(0.05, noiseFloor * 2.4));
+          const holdThreshold = Math.max(0.011, startThreshold * 0.72);
+          const activeThreshold = hasSpokenRef.current ? holdThreshold : startThreshold;
+
+          if (rms >= activeThreshold) {
+            consecutiveSpeechFrames += 1;
+            lastSpeechAt = now;
+            if (!hasSpokenRef.current && consecutiveSpeechFrames >= 2) {
+              hasSpokenRef.current = true;
+              setMicVadStatus('كنسمعك... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
+            }
+          } else {
+            consecutiveSpeechFrames = 0;
+          }
+
+          if (hasSpokenRef.current && now - lastSpeechAt >= SILENCE_AUTO_SEND_MS) {
+            if (vadIntervalRef.current !== null) {
+              window.clearInterval(vadIntervalRef.current);
+              vadIntervalRef.current = null;
+            }
+            activeRec.stop();
+            return;
+          }
+
+          if (!hasSpokenRef.current && now - startedAt >= NO_SPEECH_TIMEOUT_MS) {
+            discardRecordingRef.current = true;
+            cleanupMicVad(true);
+            setMicVadStatus(null);
+            setMicErrorMsg('ما سمعت حتى صوت فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
+            return;
+          }
+
+          if (now - startedAt >= MAX_RECORDING_MS) {
+            if (vadIntervalRef.current !== null) {
+              window.clearInterval(vadIntervalRef.current);
+              vadIntervalRef.current = null;
+            }
+            activeRec.stop();
+          }
+        }, 60);
+      }
+    } catch {
+      // If AudioContext fails on a device, user can still tap mic again to stop & transcribe
+    }
   };
 
   const handleSave = async () => {
@@ -842,8 +1216,19 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
           {/* Live Voice Activity Detection status banner */}
           {micVadStatus && (
             <div className="px-4 py-2 border-t border-red-500/30 bg-red-950/35 text-xs font-bold text-red-200 flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+              {isTranscribingMic ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#ff7a1a] shrink-0" />
+              ) : (
+                <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+              )}
               <span>{micVadStatus}</span>
+            </div>
+          )}
+
+          {micErrorMsg && (
+            <div className="px-4 py-2 border-t border-amber-500/35 bg-amber-950/35 text-xs font-bold text-amber-200 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>{micErrorMsg}</span>
             </div>
           )}
 
@@ -858,20 +1243,30 @@ export const AnalyzePlanView: React.FC<AnalyzePlanViewProps> = ({
             <button
               type="button"
               onClick={toggleVoiceQuestion}
+              disabled={isTranscribingMic || isChatSending || isAnalyzing}
               aria-label={isListeningMic ? 'حبس الميكرو وصيفط' : 'سول بالصوت (إرسال تلقائي بعد 1.5ث سكوت)'}
-              className={`min-h-[46px] min-w-[46px] rounded-xl flex items-center justify-center shrink-0 transition-colors ${
+              className={`min-h-[46px] min-w-[46px] rounded-xl flex items-center justify-center shrink-0 transition-colors disabled:opacity-50 ${
                 isListeningMic
                   ? 'bg-red-500 text-white animate-pulse'
                   : 'border border-white/15 bg-[#0a0f1e] text-[#ff7a1a] hover:border-[#ff7a1a]'
               }`}
             >
-              {isListeningMic ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+              {isTranscribingMic ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : isListeningMic ? (
+                <MicOff className="w-5 h-5" />
+              ) : (
+                <Mic className="w-5 h-5" />
+              )}
             </button>
 
             <input
               type="text"
               value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
+              onChange={(e) => {
+                setChatInput(e.target.value);
+                if (micErrorMsg) setMicErrorMsg(null);
+              }}
               placeholder="هضر بالميكرو ولا كتب سؤالك على البلان بالدارجة..."
               className="flex-1 min-h-[46px] rounded-xl border border-white/15 bg-[#0a0f1e] px-4 text-sm text-white placeholder:text-slate-500 focus:border-[#ff7a1a] focus:outline-none"
             />

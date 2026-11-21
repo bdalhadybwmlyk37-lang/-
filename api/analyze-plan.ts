@@ -1,4 +1,4 @@
- import {GoogleGenAI, Type} from '@google/genai';
+import {GoogleGenAI, ThinkingLevel, Type} from '@google/genai';
 
 type ApiRequest = {
   method?: string;
@@ -12,6 +12,8 @@ type ApiResponse = {
   json: (payload: Record<string, unknown>) => void;
   end: (chunk?: string) => void;
 };
+
+export const maxDuration = 60;
 
 const PLAN_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
@@ -209,6 +211,18 @@ function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string)
   ]);
 }
 
+function createGenAiClient(apiKey: string, useVertexAi: boolean): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey,
+    ...(useVertexAi ? {vertexai: true} : {}),
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
 export default async function handler(req: ApiRequest, res: ApiResponse): Promise<void> {
   try {
     setCorsHeaders(res);
@@ -273,25 +287,21 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
       .filter(Boolean)
       .join('\n\n');
 
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-
     const systemInstructionText =
       'أنت معلم بناء ومهندس مغربي كتجاوب 100% بالدارجة المغربية الصافية والمفهومة، وممنوع نهائياً تكتب أي كلمة بالفرنسية أو الإنجليزية أو الترجمة الحرفية بحال béton أو dalle أو ferraillage أو diamètre أو salon أو cuisine أو R+1 — استعمل غير الكلمات المغربية العربية (الضالة، السواري، الكمرة، السوميلة، الحديد، البار، القطر، السنتيم، الصالون، الكوزينة، البيت، السيما، الرملة، الكياس). إلا كانت الصورة ماشي بلان ديال البناء أو الحديد (مثلاً وجه إنسان، طريق، طابلة، حيط خاوي...)، ضروري ترد isBlueprint=false وتكتب بالضبط: "هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك".';
 
     const modelsToTry = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
     const startedAtMs = Date.now();
 
-    const runAttempt = async (modelIndex: number): Promise<string> => {
+    const runAttempt = async (
+      modelIndex: number,
+      useVertexAi: boolean,
+      useLowThinking: boolean
+    ): Promise<string> => {
       const modelName = modelsToTry[modelIndex];
       const elapsedMs = Date.now() - startedAtMs;
-      const remainingMs = Math.max(2500, 8500 - elapsedMs);
+      const remainingMs = Math.max(8000, 26000 - elapsedMs);
+      const ai = createGenAiClient(apiKey, useVertexAi);
 
       try {
         const response = await withTimeout(
@@ -304,10 +314,11 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
               systemInstruction: systemInstructionText,
               responseMimeType: 'application/json',
               responseSchema: PLAN_RESPONSE_SCHEMA,
+              ...(useLowThinking ? {thinkingConfig: {thinkingLevel: ThinkingLevel.LOW}} : {}),
             },
           }),
           remainingMs,
-          '503 timeout waiting for model'
+          `Timeout after ${remainingMs}ms on ${modelName}`
         );
 
         const text = response.text;
@@ -318,6 +329,27 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
       } catch (attemptErr) {
         const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
         const lowerMsg = errMsg.toLowerCase();
+        console.error(
+          `[analyze-plan] model=${modelName} vertex=${useVertexAi} lowThink=${useLowThinking} failed:`,
+          errMsg
+        );
+
+        const isAuthScopeError =
+          lowerMsg.includes('401') ||
+          lowerMsg.includes('403') ||
+          lowerMsg.includes('api_key_invalid') ||
+          lowerMsg.includes('api key not valid') ||
+          lowerMsg.includes('unauthenticated') ||
+          lowerMsg.includes('access_token_type_unsupported');
+
+        if (!useVertexAi && isAuthScopeError && apiKey.startsWith('AQ.')) {
+          return runAttempt(modelIndex, true, useLowThinking);
+        }
+
+        if (useLowThinking && lowerMsg.includes('think')) {
+          return runAttempt(modelIndex, useVertexAi, false);
+        }
+
         const isSwitchable =
           lowerMsg.includes('503') ||
           lowerMsg.includes('unavailable') ||
@@ -330,15 +362,14 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
           lowerMsg.includes('not_found') ||
           lowerMsg.includes('400');
 
-        const canTryNext = modelIndex + 1 < modelsToTry.length && Date.now() - startedAtMs < 6500;
-        if (isSwitchable && canTryNext) {
-          return runAttempt(modelIndex + 1);
+        if (isSwitchable && modelIndex + 1 < modelsToTry.length && Date.now() - startedAtMs < 20000) {
+          return runAttempt(modelIndex + 1, useVertexAi, true);
         }
         throw attemptErr;
       }
     };
 
-    const text = await runAttempt(0);
+    const text = await runAttempt(0, false, true);
     const parsed = JSON.parse(cleanJsonString(text)) as Record<string, unknown>;
     if (parsed.isBlueprint === false) {
       const rejection = 'هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك';
@@ -350,13 +381,13 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
     res.status(200).json({success: true, ...parsed});
   } catch (err) {
     const rawMsg = err instanceof Error ? err.message : 'تعذر تحليل البلان، عاود حاول';
+    console.error('[analyze-plan] fatal error:', rawMsg);
     const lower = rawMsg.toLowerCase();
     const isOverloaded =
       rawMsg.includes('503') ||
       lower.includes('overloaded') ||
       lower.includes('high demand') ||
-      lower.includes('unavailable') ||
-      lower.includes('timeout');
+      lower.includes('unavailable');
     res.status(isOverloaded ? 503 : 500).json({
       success: false,
       error: isOverloaded

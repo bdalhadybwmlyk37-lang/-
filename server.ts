@@ -5,7 +5,7 @@ import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import {fileURLToPath} from 'url';
-import {GoogleGenAI, ThinkingLevel, Type} from '@google/genai';
+import {GoogleGenAI, Type} from '@google/genai';
 import {TTS_MODEL, VOICE_BOY, VOICE_GIRL} from './config.js';
 
 type LockedVoiceName = typeof VOICE_GIRL | typeof VOICE_BOY;
@@ -111,7 +111,7 @@ async function generateJsonWithRetry(
     responseSchema: Record<string, unknown>;
   }
 ): Promise<unknown> {
-  const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
+  const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
   let lastErr: unknown = null;
 
   for (const model of modelsToTry) {
@@ -125,7 +125,6 @@ async function generateJsonWithRetry(
               systemInstruction: params.systemInstruction,
               responseMimeType: 'application/json',
               responseSchema: params.responseSchema,
-              thinkingConfig: {thinkingLevel: ThinkingLevel.MINIMAL},
             },
           })
         );

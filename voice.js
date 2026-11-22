@@ -11,7 +11,7 @@ const TTS_IDB_STORE = 'clips';
 const MAX_MEMORY_CACHE_ITEMS = 100;
 const MAX_LOCAL_CACHE_ITEMS = 20;
 const MAX_LOCAL_CACHE_CHARS = 3_000_000;
-const QUOTA_COOLDOWN_MS = 60_000;
+const QUOTA_COOLDOWN_MS = 8_000;
 
 let globalAudio = null;
 let audioCtx = null;
@@ -110,7 +110,7 @@ export function getVoiceId() {
       // ignore storage errors
     }
   }
-  return PREVIEW_BOY_VOICE_ID;
+  return PREVIEW_GIRL_VOICE_ID;
 }
 
 if (typeof window !== 'undefined') {

@@ -15,6 +15,8 @@ import {
 } from 'lucide-react';
 import {SpeakButton} from '../../contexts/SpeechContext';
 import {drawDetectedLinesOnOverlay} from '../../lib/lineEdgeOverlay';
+import sampleAppartImg from '../../assets/images/sample_appart_plan_1795110541026.jpg';
+import sampleVillaImg from '../../assets/images/sample_villa_plan_1795110540429.jpg';
 import type {ToolId, VoiceNoteItem} from '../../types';
 
 interface FieldToolsProps {
@@ -86,9 +88,7 @@ export const FieldToolsSuite: React.FC<FieldToolsProps> = ({
   }, [toolId]);
 
   // --- 9. Camera Measure (with live getUserMedia + Line Detection) ---
-  const [measureImg, setMeasureImg] = useState<string>(
-    '/src/assets/images/sample_appart_plan_1795110541026.jpg'
-  );
+  const [measureImg, setMeasureImg] = useState<string>(sampleAppartImg);
   const [measureCamOn, setMeasureCamOn] = useState(false);
   const [measureCamError, setMeasureCamError] = useState<string | null>(null);
   const [refMeters, setRefMeters] = useState('1.0');
@@ -165,9 +165,7 @@ export const FieldToolsSuite: React.FC<FieldToolsProps> = ({
 
   // --- 11. Draw on Image ---
   const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [drawBgSrc, setDrawBgSrc] = useState<string>(
-    initialDrawImage || '/src/assets/images/sample_villa_plan_1795110540429.jpg'
-  );
+  const [drawBgSrc, setDrawBgSrc] = useState<string>(initialDrawImage || sampleVillaImg);
   const [drawColor, setDrawColor] = useState('#ff7a1a');
   const [drawWidth, setDrawWidth] = useState(4);
   const [isDrawing, setIsDrawing] = useState(false);

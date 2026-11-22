@@ -11,6 +11,9 @@ import {
   ArrowLeft,
 } from 'lucide-react';
 import {SpeakButton} from '../contexts/SpeechContext';
+import heroBlueprintImg from '../assets/images/hero_blueprint_studio_1795110540555.jpg';
+import sampleAppartImg from '../assets/images/sample_appart_plan_1795110541026.jpg';
+import sampleVillaImg from '../assets/images/sample_villa_plan_1795110540429.jpg';
 import type {AppTab, SavedPlan} from '../types';
 
 interface HomeViewProps {
@@ -26,13 +29,13 @@ const SAMPLE_PLANS = [
     id: 'sample-villa',
     title: 'بلان فيلا عصرية R+1',
     meta: '16.1 × 16.1 م · صالون مغربي · فناء · كوزينة · كراج',
-    src: '/src/assets/images/sample_villa_plan_1795110540429.jpg',
+    src: sampleVillaImg,
   },
   {
     id: 'sample-appart',
     title: 'بلان شقة سكنية 95 م²',
     meta: '95 م² · صالون · 2 غرف · كوزينة · حمام · بالكون',
-    src: '/src/assets/images/sample_appart_plan_1795110541026.jpg',
+    src: sampleAppartImg,
   },
 ];
 
@@ -161,7 +164,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
           <div className="lg:col-span-5 relative min-h-[240px] lg:min-h-full bg-[#0a0f1e]">
             <img
-              src="/src/assets/images/hero_blueprint_studio_1795110540555.jpg"
+              src={heroBlueprintImg}
               alt="مكتب هندسي بمخطط بناء مغربي ومسطرة القياس"
               referrerPolicy="no-referrer"
               className="w-full h-full object-cover"

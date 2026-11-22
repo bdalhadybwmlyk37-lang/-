@@ -18,6 +18,7 @@ import {SpeakButton} from '../../contexts/SpeechContext';
 import {useTrialQuota, WHATSAPP_NUMBER_DISPLAY, WHATSAPP_URL} from '../../hooks/useTrialQuota';
 import {prepareImageFromSrc, readFileAsDataUrl} from '../../lib/imageUtils';
 import {drawDetectedLinesOnOverlay} from '../../lib/lineEdgeOverlay';
+import sampleVillaImg from '../../assets/images/sample_villa_plan_1795110540429.jpg';
 import type {ToolId} from '../../types';
 
 interface SmartToolkitProps {
@@ -811,7 +812,7 @@ export const SmartToolkitSuite: React.FC<SmartToolkitProps> = ({toolId}) => {
             </>
           ) : (
             <img
-              src={arSnapshot || '/src/assets/images/sample_villa_plan_1795110540429.jpg'}
+              src={arSnapshot || sampleVillaImg}
               alt="لقطة متر AR"
               referrerPolicy="no-referrer"
               className="w-full h-full object-contain pointer-events-none"

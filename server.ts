@@ -41,34 +41,59 @@ const serverAccessCodes: ServerAccessCode[] = [
   },
 ];
 
-function resolveServerAiApiKey(): string | null {
-  const candidates = [
+const badAuthAiKeys = new Set<string>();
+let extraVaultKeysResolver: () => string[] = () => [];
+
+function resolveServerAiApiKeys(): string[] {
+  const rawCandidates: Array<string | undefined> = [
     process.env.GEMINI_API_KEY,
     process.env.GOOGLE_API_KEY,
     process.env.AI_API_KEY,
   ];
-  for (const val of candidates) {
-    const trimmed = typeof val === 'string' ? val.trim() : '';
-    if (trimmed && trimmed !== 'MY_GEMINI_API_KEY') {
-      return trimmed;
+  const ttsListRaw = process.env.GEMINI_TTS_KEYS || '';
+  if (ttsListRaw.trim()) {
+    for (const part of ttsListRaw.split(/[\r\n,;]+/)) {
+      rawCandidates.push(part);
     }
   }
-  return null;
+  for (let i = 1; i <= 20; i++) {
+    rawCandidates.push(process.env[`GEMINI_API_KEY_${i}`]);
+  }
+  for (const vaultKey of extraVaultKeysResolver()) {
+    rawCandidates.push(vaultKey);
+  }
+
+  const valid: string[] = [];
+  const dead: string[] = [];
+  const seen = new Set<string>();
+  for (const val of rawCandidates) {
+    const trimmed = typeof val === 'string' ? val.trim() : '';
+    if (!trimmed || trimmed === 'MY_GEMINI_API_KEY' || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    if (badAuthAiKeys.has(trimmed)) {
+      dead.push(trimmed);
+    } else {
+      valid.push(trimmed);
+    }
+  }
+  return [...valid, ...dead];
 }
 
-function getAiClient() {
-  const apiKey = resolveServerAiApiKey();
-  if (!apiKey) {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+function resolveServerAiApiKey(): string | null {
+  return resolveServerAiApiKeys()[0] || null;
+}
+
+function isGeminiAuthErrorMessage(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes('401') ||
+    lower.includes('403') ||
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('permission_denied') ||
+    lower.includes('unauthenticated') ||
+    lower.includes('access_token_type_unsupported')
+  );
 }
 
 function cleanJsonString(raw: string): string {
@@ -103,52 +128,80 @@ function enqueueGoogleRequest<T>(task: () => Promise<T>): Promise<T> {
 const planAnalysisCache = new Map<string, Record<string, unknown>>();
 const MAX_PLAN_ANALYSIS_CACHE = 100;
 
-async function generateJsonWithRetry(
-  ai: GoogleGenAI,
-  params: {
-    contents: unknown;
-    systemInstruction: string;
-    responseSchema: Record<string, unknown>;
+async function generateJsonWithRetry(params: {
+  contents: unknown;
+  systemInstruction: string;
+  responseSchema: Record<string, unknown>;
+}): Promise<unknown> {
+  const keysToTry = resolveServerAiApiKeys();
+  if (keysToTry.length === 0) {
+    throw new Error('مفتاح الذكاء الاصطناعي غير مضبوط على الخادم (GEMINI_API_KEY).');
   }
-): Promise<unknown> {
   const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
   let lastErr: unknown = null;
 
-  for (const model of modelsToTry) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const response = await enqueueGoogleRequest(() =>
-          ai.models.generateContent({
-            model,
-            contents: params.contents as Parameters<typeof ai.models.generateContent>[0]['contents'],
-            config: {
-              systemInstruction: params.systemInstruction,
-              responseMimeType: 'application/json',
-              responseSchema: params.responseSchema,
+  for (const key of keysToTry) {
+    let useVertexAi = false;
+    let keyAuthDead = false;
+
+    for (const model of modelsToTry) {
+      if (keyAuthDead) break;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const client = new GoogleGenAI({
+            apiKey: key,
+            ...(useVertexAi ? {vertexai: true} : {}),
+            httpOptions: {
+              headers: {
+                'User-Agent': 'aistudio-build',
+              },
             },
-          })
-        );
-        const text = response.text;
-        if (!text) {
-          throw new Error('رد فارغ من الذكاء الاصطناعي');
+          });
+          const response = await enqueueGoogleRequest(() =>
+            client.models.generateContent({
+              model,
+              contents: params.contents as Parameters<typeof client.models.generateContent>[0]['contents'],
+              config: {
+                systemInstruction: params.systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema: params.responseSchema,
+              },
+            })
+          );
+          const text = response.text;
+          if (!text) {
+            throw new Error('رد فارغ من الذكاء الاصطناعي');
+          }
+          badAuthAiKeys.delete(key);
+          return JSON.parse(cleanJsonString(text));
+        } catch (err) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          const lower = msg.toLowerCase();
+
+          if (isGeminiAuthErrorMessage(msg)) {
+            if (!useVertexAi && key.startsWith('AQ.')) {
+              useVertexAi = true;
+              continue;
+            }
+            badAuthAiKeys.add(key);
+            keyAuthDead = true;
+            break;
+          }
+
+          const isTransient =
+            lower.includes('503') ||
+            lower.includes('unavailable') ||
+            lower.includes('overloaded') ||
+            lower.includes('high demand') ||
+            lower.includes('429') ||
+            lower.includes('resource_exhausted');
+          if (isTransient && attempt === 0) {
+            await new Promise((r) => setTimeout(r, 650));
+            continue;
+          }
+          break;
         }
-        return JSON.parse(cleanJsonString(text));
-      } catch (err) {
-        lastErr = err;
-        const msg = err instanceof Error ? err.message : String(err);
-        const lower = msg.toLowerCase();
-        const isTransient =
-          lower.includes('503') ||
-          lower.includes('unavailable') ||
-          lower.includes('overloaded') ||
-          lower.includes('high demand') ||
-          lower.includes('429') ||
-          lower.includes('resource_exhausted');
-        if (isTransient && attempt === 0) {
-          await new Promise((r) => setTimeout(r, 650));
-          continue;
-        }
-        break;
       }
     }
   }
@@ -516,8 +569,7 @@ async function startServer() {
 
   app.post('/api/analyze-plan', async (req, res) => {
     try {
-      const ai = getAiClient();
-      if (!ai) {
+      if (resolveServerAiApiKeys().length === 0) {
         res.status(503).json({
           success: false,
           error: 'مفتاح الذكاء الاصطناعي غير مضبوط على الخادم (GEMINI_API_KEY).',
@@ -571,7 +623,7 @@ async function startServer() {
         .filter(Boolean)
         .join('\n\n');
 
-      const parsed = (await generateJsonWithRetry(ai, {
+      const parsed = (await generateJsonWithRetry({
         contents: {
           parts: [
             {inlineData: {mimeType: safeMime, data: cleanBase64}},
@@ -613,8 +665,7 @@ async function startServer() {
   });
 
   app.post('/api/chat-plan', async (req, res) => {
-    const ai = getAiClient();
-    if (!ai) {
+    if (resolveServerAiApiKeys().length === 0) {
       res.status(503).json({error: 'خدمة الدردشة غير مفعلة حالياً على الخادم.'});
       return;
     }
@@ -653,7 +704,7 @@ async function startServer() {
     parts.push({text: promptText});
 
     try {
-      const parsed = await generateJsonWithRetry(ai, {
+      const parsed = await generateJsonWithRetry({
         contents: {parts},
         systemInstruction:
           'أنت المعلم ومهندس مغربي في تطبيق فاهم بلان. جاوب المستخدم في الدردشة على سؤالو حول البلان ديالو بـ 100% دارجة مغربية حقيقية وساهلة ومفهومة، بلا حتى كلمة فرنسية أو إنجليزية أو رموز غريبة. ركز مزيان على تفاصيل الحديد (فين كاين الحديد، شحال من بار، المسافات بين القضبان، السواري، الضالة، الكمرة)، المساحات والسلعة. وإلى كانت الصورة ماشي ديال البلان قول ليه: هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك.',
@@ -680,8 +731,7 @@ async function startServer() {
   });
 
   app.post('/api/detect-cracks', async (req, res) => {
-    const ai = getAiClient();
-    if (!ai) {
+    if (resolveServerAiApiKeys().length === 0) {
       res.status(503).json({error: 'خدمة كشف الشقوق غير مفعلة حالياً على الخادم.'});
       return;
     }
@@ -696,7 +746,7 @@ async function startServer() {
     const safeMime = mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg';
 
     try {
-      const parsed = await generateJsonWithRetry(ai, {
+      const parsed = await generateJsonWithRetry({
         contents: {
           parts: [
             {inlineData: {mimeType: safeMime, data: cleanBase64}},
@@ -719,8 +769,7 @@ async function startServer() {
   });
 
   app.post('/api/voice-idea-summary', async (req, res) => {
-    const ai = getAiClient();
-    if (!ai) {
+    if (resolveServerAiApiKeys().length === 0) {
       res.status(503).json({error: 'خدمة الذكاء الاصطناعي غير متوفرة حالياً على الخادم.'});
       return;
     }
@@ -732,7 +781,7 @@ async function startServer() {
     }
 
     try {
-      const parsed = await generateJsonWithRetry(ai, {
+      const parsed = await generateJsonWithRetry({
         contents: `نظم هاد الفكرة الصوتية ديال الشانطي وعطيها عنوان قصير وخلاصة مرتبة بالدارجة المغربية على شكل نقط عملية:\n"${rawIdea.slice(0, 2500)}"`,
         systemInstruction:
           'أنت مساعد بناء مغربي كتقيد أفكار المعلم أو مول الدار وترتبها بالدارجة المغربية الواضحة في نقط عملية قصيرة.',
@@ -753,8 +802,8 @@ async function startServer() {
   });
 
   app.post('/api/transcribe', async (req, res) => {
-    const apiKey = resolveServerAiApiKey();
-    if (!apiKey) {
+    const keysToTry = resolveServerAiApiKeys();
+    if (keysToTry.length === 0) {
       res.status(503).json({
         success: false,
         error: 'مفتاح الذكاء الاصطناعي غير مضبوط على الخادم (GEMINI_API_KEY).',
@@ -797,62 +846,78 @@ async function startServer() {
       'gemini-3.1-flash-lite',
     ];
 
-    const runAttempt = async (modelIndex: number, useVertexAi: boolean): Promise<string> => {
-      const modelName = modelsToTry[modelIndex];
-      const client = new GoogleGenAI({
-        apiKey,
-        ...(useVertexAi ? {vertexai: true} : {}),
-        httpOptions: {headers: {'User-Agent': 'aistudio-build'}},
-      });
+    const runWithKeys = async (): Promise<string> => {
+      let lastErr: unknown = null;
 
-      try {
-        const response = await enqueueGoogleRequest(() =>
-          client.models.generateContent({
-            model: modelName,
-            contents: {
-              parts: [
-                {inlineData: {mimeType: baseMime, data: cleanBase64}},
-                {text: promptText},
-              ],
-            },
-          })
-        );
-        return response.text || '';
-      } catch (attemptErr) {
-        const msg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
-        const lower = msg.toLowerCase();
-        const isAuthScopeError =
-          lower.includes('401') ||
-          lower.includes('403') ||
-          lower.includes('api_key_invalid') ||
-          lower.includes('api key not valid') ||
-          lower.includes('unauthenticated') ||
-          lower.includes('access_token_type_unsupported');
+      for (const candidateKey of keysToTry) {
+        let useVertexAi = false;
+        let keyAuthDead = false;
 
-        if (!useVertexAi && isAuthScopeError && apiKey.startsWith('AQ.')) {
-          return runAttempt(modelIndex, true);
+        for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
+          if (keyAuthDead) break;
+          const modelName = modelsToTry[modelIndex];
+
+          for (let authAttempt = 0; authAttempt < 2; authAttempt++) {
+            const client = new GoogleGenAI({
+              apiKey: candidateKey,
+              ...(useVertexAi ? {vertexai: true} : {}),
+              httpOptions: {headers: {'User-Agent': 'aistudio-build'}},
+            });
+
+            try {
+              const response = await enqueueGoogleRequest(() =>
+                client.models.generateContent({
+                  model: modelName,
+                  contents: {
+                    parts: [
+                      {inlineData: {mimeType: baseMime, data: cleanBase64}},
+                      {text: promptText},
+                    ],
+                  },
+                })
+              );
+              badAuthAiKeys.delete(candidateKey);
+              return response.text || '';
+            } catch (attemptErr) {
+              lastErr = attemptErr;
+              const msg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
+              const lower = msg.toLowerCase();
+
+              if (isGeminiAuthErrorMessage(msg)) {
+                if (!useVertexAi && candidateKey.startsWith('AQ.')) {
+                  useVertexAi = true;
+                  continue;
+                }
+                badAuthAiKeys.add(candidateKey);
+                keyAuthDead = true;
+                break;
+              }
+
+              const isSwitchable =
+                lower.includes('503') ||
+                lower.includes('unavailable') ||
+                lower.includes('overloaded') ||
+                lower.includes('high demand') ||
+                lower.includes('429') ||
+                lower.includes('resource_exhausted') ||
+                lower.includes('404') ||
+                lower.includes('not_found') ||
+                lower.includes('400');
+
+              if (isSwitchable) {
+                break; // try next model
+              }
+              throw attemptErr;
+            }
+          }
         }
-
-        const isSwitchable =
-          lower.includes('503') ||
-          lower.includes('unavailable') ||
-          lower.includes('overloaded') ||
-          lower.includes('high demand') ||
-          lower.includes('429') ||
-          lower.includes('resource_exhausted') ||
-          lower.includes('404') ||
-          lower.includes('not_found') ||
-          lower.includes('400');
-
-        if (isSwitchable && modelIndex + 1 < modelsToTry.length) {
-          return runAttempt(modelIndex + 1, useVertexAi);
-        }
-        throw attemptErr;
       }
+
+      throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
     };
 
     try {
-      const raw = await runAttempt(0, false);
+      const raw = await runWithKeys();
       const cleaned = raw
         .replace(/^```[\w-]*\s*/i, '')
         .replace(/\s*```$/i, '')
@@ -946,7 +1011,7 @@ async function startServer() {
   const MAX_TTS_KEY_SLOTS = 20;
   const TTS_KEY_RESET_MS = 24 * 60 * 60 * 1000;
   const TTS_MAX_SERVER_CACHE = 250;
-  const TTS_ALL_EXHAUSTED_COOLDOWN_MS = 45_000;
+  const TTS_ALL_EXHAUSTED_COOLDOWN_MS = 8_000;
   const TTS_MODELS_TO_TRY = [
     'gemini-3.8-flash-lite-tts',
     'gemini-3.8-flash-tts',
@@ -1046,6 +1111,16 @@ async function startServer() {
   }
 
   const ttsKeyVault: StoredTtsApiKey[] = loadTtsVaultFromDisk();
+  extraVaultKeysResolver = () => {
+    const out: string[] = [];
+    for (const rec of ttsKeyVault) {
+      const plain = decryptTtsKey(rec.key);
+      if (plain && plain.trim()) {
+        out.push(plain.trim());
+      }
+    }
+    return out;
+  };
   console.log(`[TTS Vault] Loaded ${ttsKeyVault.length} keys from ${path.basename(TTS_VAULT_FILE)} (model=${TTS_MODEL})`);
   for (const rec of ttsKeyVault) {
     const plain = decryptTtsKey(rec.key);
@@ -1279,6 +1354,8 @@ async function startServer() {
         }
 
         const isModelSwitchable =
+          lower.includes('429') ||
+          lower.includes('resource_exhausted') ||
           lower.includes('404') ||
           lower.includes('not_found') ||
           lower.includes('not found') ||

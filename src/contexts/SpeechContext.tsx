@@ -79,7 +79,7 @@ const SELECTED_VOICE_KEY = 'selectedVoice';
 
 const DEFAULT_SETTINGS: UserSettings = {
   voiceEnabled: true,
-  voiceGender: 'male',
+  voiceGender: 'female',
   speechRate: 0.95,
 };
 

@@ -120,19 +120,30 @@ function setCorsHeaders(res: ApiResponse): void {
   res.setHeader('Cache-Control', 'no-store');
 }
 
-function resolveApiKey(): string | null {
-  const candidates = [
+function resolveApiKeys(): string[] {
+  const rawCandidates: Array<string | undefined> = [
     process.env.GEMINI_API_KEY,
     process.env.GOOGLE_API_KEY,
     process.env.AI_API_KEY,
   ];
-  for (const candidate of candidates) {
-    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
-    if (trimmed && trimmed !== 'MY_GEMINI_API_KEY') {
-      return trimmed;
+  const ttsListRaw = process.env.GEMINI_TTS_KEYS || '';
+  if (ttsListRaw.trim()) {
+    for (const part of ttsListRaw.split(/[\r\n,;]+/)) {
+      rawCandidates.push(part);
     }
   }
-  return null;
+  for (let i = 1; i <= 20; i++) {
+    rawCandidates.push(process.env[`GEMINI_API_KEY_${i}`]);
+  }
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of rawCandidates) {
+    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
+    if (!trimmed || trimmed === 'MY_GEMINI_API_KEY' || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    unique.push(trimmed);
+  }
+  return unique;
 }
 
 function cleanJsonString(raw: string): string {
@@ -240,8 +251,8 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
       return;
     }
 
-    const apiKey = resolveApiKey();
-    if (!apiKey) {
+    const apiKeys = resolveApiKeys();
+    if (apiKeys.length === 0) {
       res.status(503).json({
         success: false,
         error: 'مفتاح الذكاء الاصطناعي غير مضبوط في إعدادات الخادم (GEMINI_API_KEY).',
@@ -294,14 +305,16 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
     const startedAtMs = Date.now();
 
     const runAttempt = async (
+      keyIndex: number,
       modelIndex: number,
       useVertexAi: boolean,
       useLowThinking: boolean
     ): Promise<string> => {
+      const activeKey = apiKeys[keyIndex];
       const modelName = modelsToTry[modelIndex];
       const elapsedMs = Date.now() - startedAtMs;
       const remainingMs = Math.max(8000, 26000 - elapsedMs);
-      const ai = createGenAiClient(apiKey, useVertexAi);
+      const ai = createGenAiClient(activeKey, useVertexAi);
 
       try {
         const response = await withTimeout(
@@ -330,7 +343,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
         const errMsg = attemptErr instanceof Error ? attemptErr.message : String(attemptErr);
         const lowerMsg = errMsg.toLowerCase();
         console.error(
-          `[analyze-plan] model=${modelName} vertex=${useVertexAi} lowThink=${useLowThinking} failed:`,
+          `[analyze-plan] key=${keyIndex + 1}/${apiKeys.length} model=${modelName} vertex=${useVertexAi} lowThink=${useLowThinking} failed:`,
           errMsg
         );
 
@@ -339,15 +352,20 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
           lowerMsg.includes('403') ||
           lowerMsg.includes('api_key_invalid') ||
           lowerMsg.includes('api key not valid') ||
+          lowerMsg.includes('permission_denied') ||
           lowerMsg.includes('unauthenticated') ||
           lowerMsg.includes('access_token_type_unsupported');
 
-        if (!useVertexAi && isAuthScopeError && apiKey.startsWith('AQ.')) {
-          return runAttempt(modelIndex, true, useLowThinking);
+        if (!useVertexAi && isAuthScopeError && activeKey.startsWith('AQ.')) {
+          return runAttempt(keyIndex, modelIndex, true, useLowThinking);
+        }
+
+        if (isAuthScopeError && keyIndex + 1 < apiKeys.length && Date.now() - startedAtMs < 22000) {
+          return runAttempt(keyIndex + 1, 0, false, true);
         }
 
         if (useLowThinking && lowerMsg.includes('think')) {
-          return runAttempt(modelIndex, useVertexAi, false);
+          return runAttempt(keyIndex, modelIndex, useVertexAi, false);
         }
 
         const isSwitchable =
@@ -363,13 +381,17 @@ export default async function handler(req: ApiRequest, res: ApiResponse): Promis
           lowerMsg.includes('400');
 
         if (isSwitchable && modelIndex + 1 < modelsToTry.length && Date.now() - startedAtMs < 20000) {
-          return runAttempt(modelIndex + 1, useVertexAi, true);
+          return runAttempt(keyIndex, modelIndex + 1, useVertexAi, true);
+        }
+
+        if (isSwitchable && keyIndex + 1 < apiKeys.length && Date.now() - startedAtMs < 22000) {
+          return runAttempt(keyIndex + 1, 0, false, true);
         }
         throw attemptErr;
       }
     };
 
-    const text = await runAttempt(0, false, true);
+    const text = await runAttempt(0, 0, false, true);
     const parsed = JSON.parse(cleanJsonString(text)) as Record<string, unknown>;
     if (parsed.isBlueprint === false) {
       const rejection = 'هادي ماشي صورة ديال البلان، عافاك صور بلان ديال الحديد باش نشرحو ليك';
